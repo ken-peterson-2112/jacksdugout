@@ -145,88 +145,8 @@ const DEFAULT_ROSTER = [
   { id:"13", name:"Strachan", number:"15", positionMap:{ P:"preferred","2B":"preferred",SS:"secondary:2",C:"emergency:2" } },
 ];
 
-// ══════════════════════════════════════════════════
-// SUPABASE CLOUD SYNC
-// ══════════════════════════════════════════════════
-// Strategy: keep the load(k, fb) / save(k, v) API identical so the rest of
-// the 3,400-line app doesn't change. Reads come from an in-memory cache that
-// is hydrated from Supabase on boot (with localStorage as offline fallback).
-// Writes go to localStorage immediately (so the UI stays snappy) AND queue a
-// write to Supabase if the user is signed in. Anyone (no auth) can VIEW data
-// via the public-read RLS policy; only signed-in coaches can persist changes.
-const SUPABASE_URL = "https://aeyxvqtelsihvxxxpifo.supabase.co";
-const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFleXh2cXRlbHNpaHZ4eHhwaWZvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzcxMzMzMDMsImV4cCI6MjA5MjcwOTMwM30.6ZMj4sMaFFTBMOENRByYkkgKWFamYaJcG8to0XFsV34";
-
-const sb = window.supabase
-  ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
-  : null;
-
-// In-memory cache. Hydrated from Supabase on boot, kept in sync on writes.
-// Reads from this cache are synchronous so load(k, fb) preserves its API.
-const cloudCache = {};
-let cloudReady = false;
-const cloudListeners = new Set();
-function notifyCloudReady() { cloudListeners.forEach(fn => { try { fn(); } catch {} }); }
-
-async function hydrateFromCloud() {
-  if (!sb) { cloudReady = true; notifyCloudReady(); return; }
-  try {
-    const { data, error } = await sb.from("team_state").select("key, value");
-    if (error) throw error;
-    if (data) data.forEach(row => { cloudCache[row.key] = row.value; });
-  } catch (e) {
-    console.warn("Cloud hydrate failed, using local cache:", e.message);
-  }
-  cloudReady = true;
-  notifyCloudReady();
-}
-hydrateFromCloud();
-
-// Per-key write queue. Coalesces rapid saves (e.g. typing in a name field
-// fires many saves). Each key has at most one pending and one in-flight write.
-const writeQueue = {};
-async function pushToCloud(key, value) {
-  if (!sb) return;
-  const { data: { session } } = await sb.auth.getSession();
-  if (!session) return; // viewers don't write
-  const { error } = await sb.from("team_state").upsert(
-    { key, value, updated_at: new Date().toISOString(), updated_by: session.user.id },
-    { onConflict: "key" }
-  );
-  if (error) console.warn("Cloud save failed for", key, error.message);
-}
-function queueCloudWrite(key, value) {
-  if (!sb) return;
-  if (writeQueue[key]?.inFlight) {
-    writeQueue[key].pending = value;
-    return;
-  }
-  writeQueue[key] = { inFlight: true, pending: null };
-  (async () => {
-    let v = value;
-    while (true) {
-      await pushToCloud(key, v);
-      const next = writeQueue[key].pending;
-      if (next === null) { writeQueue[key].inFlight = false; return; }
-      writeQueue[key].pending = null;
-      v = next;
-    }
-  })();
-}
-
-// Public load/save — same signature as before. Reads cloud cache first (with
-// localStorage as fallback for first-load before hydration completes); writes
-// go to both localStorage (instant, offline-safe) and the cloud queue.
-function load(k, fb) {
-  if (k in cloudCache) return cloudCache[k];
-  try { const r = localStorage.getItem(k); return r ? JSON.parse(r) : fb; }
-  catch { return fb; }
-}
-function save(k, v) {
-  cloudCache[k] = v;
-  try { localStorage.setItem(k, JSON.stringify(v)); } catch {}
-  queueCloudWrite(k, v);
-}
+function load(k, fb) { try { const r = localStorage.getItem(k); return r ? JSON.parse(r) : fb; } catch { return fb; } }
+function save(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} }
 // positionMap values may be bare tiers ("preferred") or tier-with-rank ("secondary:2").
 // Rank breaks ties within a tier (1 = top). Missing rank defaults to 1.
 function playerTier(player, pos) {
@@ -1685,106 +1605,9 @@ function generatePNG(grid, posHistory, roster, innings) {
 }
 
 // ══════════════════════════════════════════════════
-// LOGIN BAR
-// ══════════════════════════════════════════════════
-// Compact auth UI rendered in the top header. Three states:
-//   1. Not signed in → "Sign in" button (parents/players see this; read-only)
-//   2. Signed in → email pill + "Sign out" link (coaches see this; can edit)
-//   3. Sign-in modal → email + password form
-// Sign-up is intentionally not exposed in the UI — coaches are invited by
-// email from the Supabase dashboard, which delivers a "set your password"
-// link. This keeps the team's editor list tightly controlled.
-function LoginBar({ session, onChange }) {
-  const [open, setOpen] = useState(false);
-  const [email, setEmail] = useState("");
-  const [pw, setPw] = useState("");
-  const [err, setErr] = useState("");
-  const [busy, setBusy] = useState(false);
-
-  async function signIn() {
-    setBusy(true); setErr("");
-    const { error } = await sb.auth.signInWithPassword({ email, password: pw });
-    setBusy(false);
-    if (error) { setErr(error.message); return; }
-    setOpen(false); setEmail(""); setPw("");
-  }
-  async function signOut() {
-    await sb.auth.signOut();
-  }
-
-  if (!sb) return null;
-
-  return (
-    <>
-      <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 8 }}>
-        {session ? (
-          <>
-            <span style={{ fontSize: 11, color: C.textMuted, background: C.surfaceAlt, padding: "4px 8px", borderRadius: 4, border: `1px solid ${C.border}`, maxWidth: 160, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-              {session.user.email}
-            </span>
-            <button onClick={signOut} style={{ fontSize: 11, color: C.textMuted, background: "transparent", border: "none", cursor: "pointer", padding: "4px 6px" }}>
-              Sign out
-            </button>
-          </>
-        ) : (
-          <button onClick={() => setOpen(true)} style={{ fontSize: 12, color: C.surface, background: C.accent, border: "none", padding: "6px 12px", borderRadius: 4, cursor: "pointer", fontWeight: 600 }}>
-            Coach sign in
-          </button>
-        )}
-      </div>
-      {open && (
-        <div onClick={() => setOpen(false)} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.4)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
-          <div onClick={(e) => e.stopPropagation()} style={{ background: C.surface, borderRadius: 8, padding: 20, maxWidth: 320, width: "100%", boxShadow: "0 4px 16px rgba(0,0,0,0.15)" }}>
-            <h2 style={{ fontFamily: DISPLAY, fontSize: 18, marginBottom: 4, color: C.text }}>Coach sign in</h2>
-            <p style={{ fontSize: 12, color: C.textMuted, marginBottom: 16 }}>
-              Use the email and password from your invitation.
-            </p>
-            <input type="email" placeholder="Email" value={email} onChange={(e) => setEmail(e.target.value)}
-              style={{ width: "100%", padding: "8px 10px", fontSize: 14, border: `1px solid ${C.border}`, borderRadius: 4, marginBottom: 8, fontFamily: FONT }} />
-            <input type="password" placeholder="Password" value={pw} onChange={(e) => setPw(e.target.value)}
-              onKeyDown={(e) => { if (e.key === "Enter") signIn(); }}
-              style={{ width: "100%", padding: "8px 10px", fontSize: 14, border: `1px solid ${C.border}`, borderRadius: 4, marginBottom: 12, fontFamily: FONT }} />
-            {err && <div style={{ fontSize: 12, color: C.redText, background: C.redLight, padding: "6px 8px", borderRadius: 4, marginBottom: 12 }}>{err}</div>}
-            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
-              <button onClick={() => setOpen(false)} style={{ fontSize: 13, color: C.textMuted, background: "transparent", border: `1px solid ${C.border}`, padding: "6px 12px", borderRadius: 4, cursor: "pointer" }}>
-                Cancel
-              </button>
-              <button onClick={signIn} disabled={busy || !email || !pw} style={{ fontSize: 13, color: C.surface, background: C.accent, border: "none", padding: "6px 12px", borderRadius: 4, cursor: busy ? "default" : "pointer", fontWeight: 600, opacity: (busy || !email || !pw) ? 0.5 : 1 }}>
-                {busy ? "Signing in..." : "Sign in"}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-    </>
-  );
-}
-
-// ══════════════════════════════════════════════════
 // APP
 // ══════════════════════════════════════════════════
 function App() {
-  // Auth session — null when not signed in, populated when a coach signs in.
-  // Drives the LoginBar display and gates write-back to Supabase.
-  const [session, setSession] = useState(null);
-  // Bumped when cloud hydration completes so all the load(...) initializers
-  // re-run with fresh data. Also bumped on sign-in / sign-out so the app picks
-  // up any changes made by other coaches while we were viewing.
-  const [cloudGen, setCloudGen] = useState(0);
-
-  useEffect(() => {
-    if (!sb) return;
-    sb.auth.getSession().then(({ data }) => setSession(data.session));
-    const { data: sub } = sb.auth.onAuthStateChange((_evt, sess) => {
-      setSession(sess);
-      // Re-hydrate so signed-in coaches see the latest server state
-      hydrateFromCloud().then(() => setCloudGen(g => g + 1));
-    });
-    const onReady = () => setCloudGen(g => g + 1);
-    cloudListeners.add(onReady);
-    return () => { sub?.subscription?.unsubscribe(); cloudListeners.delete(onReady); };
-  }, []);
-
   const [roster, setRoster] = useState(() => {
     const storedVer = load("dugout_roster_version", 0);
     if (storedVer < ROSTER_VERSION) {
@@ -1841,28 +1664,6 @@ function App() {
     gameType: "season",
   }));
   useEffect(() => { save("dugout_gameMeta", gameMeta); }, [gameMeta]);
-
-  // When cloud cache hydrates (or re-hydrates after sign-in), refresh state
-  // from the cache. Skip cloudGen=0 because the useState initializers above
-  // already read from load() on first mount — we only react to subsequent
-  // hydrations. Without this, a coach signing in would still see the stale
-  // pre-auth state until they refreshed the page.
-  const cloudGenRef = useRef(0);
-  useEffect(() => {
-    if (cloudGen === 0) { cloudGenRef.current = 0; return; }
-    if (cloudGen === cloudGenRef.current) return;
-    cloudGenRef.current = cloudGen;
-    const cloudRoster = load("dugout_roster", null);
-    if (cloudRoster) setRoster(cloudRoster);
-    const cloudPitchLogs = load("dugout_pitchLogs", null);
-    if (cloudPitchLogs) setPitchLogs(cloudPitchLogs);
-    const cloudSchedule = load("dugout_schedule", null);
-    if (cloudSchedule) setSchedule(cloudSchedule);
-    const cloudBenchTiers = load("dugout_benchTiers", null);
-    if (cloudBenchTiers) setBenchTiers(cloudBenchTiers);
-    const cloudGameMeta = load("dugout_gameMeta", null);
-    if (cloudGameMeta) setGameMeta(cloudGameMeta);
-  }, [cloudGen]);
 
   // Transient: id of the schedule entry the user is currently editing. Set
   // when they click into a game from the calendar; null for a one-off lineup
@@ -2037,10 +1838,10 @@ function App() {
 
   const tabs = [
     { id:"schedule", label:"Schedule" },
-    { id:"roster", label:"Roster" },
-    { id:"armcare", label:"Arm Care" },
-    { id:"setup", label:"Game Settings" },
-    { id:"lineup", label:"Lineup" },
+    { id:"roster",   label:"Roster" },
+    { id:"armcare",  label:"Arm Care" },
+    { id:"setup",    label:"Game Settings" },
+    { id:"lineup",   label:"Lineup" },
   ];
 
   return (
@@ -2048,7 +1849,6 @@ function App() {
       <div style={{ background: C.surface, borderBottom: `1px solid ${C.border}`, padding: "16px 20px", display: "flex", alignItems: "center", boxShadow: "0 1px 3px rgba(0,0,0,0.04)" }}>
         <span style={{ fontFamily: DISPLAY, fontSize: 22, fontWeight: 700, color: C.accent }}>Dugout</span>
         <span style={{ fontSize: 12, color: C.textMuted, fontWeight: 500, marginLeft: 10 }}>11U OBA</span>
-        <LoginBar session={session} onChange={setSession} />
       </div>
       <div style={{ display: "flex", background: C.surface, borderBottom: `1px solid ${C.border}`, overflowX: "auto" }}>
         {tabs.map(t => (
@@ -2063,8 +1863,8 @@ function App() {
       </div>
       <div style={{ maxWidth: 920, margin: "0 auto", padding: "20px 16px" }}>
         {tab === "schedule" && <ScheduleTab schedule={schedule} setSchedule={setSchedule} roster={sortedRoster} onOpenGame={handleOpenScheduleEntry} />}
-        {tab === "roster" && <RosterTab roster={sortedRoster} setRoster={setRoster} />}
         {tab === "armcare" && <ArmCareTab roster={sortedRoster} pitchLogs={pitchLogs} setPitchLogs={setPitchLogs} />}
+        {tab === "roster" && <RosterTab roster={sortedRoster} setRoster={setRoster} />}
         {tab === "setup" && <SetupTab roster={sortedRoster} availablePlayers={availablePlayers} absentIds={absentIds} setAbsentIds={setAbsentIds}
           pitcherAssignments={pitcherAssignments} setPitcherAssignments={setPitcherAssignments}
           catcherAssignments={catcherAssignments} setCatcherAssignments={setCatcherAssignments}
@@ -2255,7 +2055,7 @@ function RosterTab({ roster, setRoster }) {
 // ══════════════════════════════════════════════════
 // ARM CARE TAB
 // ══════════════════════════════════════════════════
-function ArmCareTab({ roster, pitchLogs, setPitchLogs }) {
+function ArmCareTab({ roster, pitchLogs, setPitchLogs, canEdit = true }) {
   const [sortCol, setSortCol] = useState("name");
   const [sortDir, setSortDir] = useState("asc");
   const [logPitcher, setLogPitcher] = useState("");
@@ -2330,18 +2130,20 @@ function ArmCareTab({ roster, pitchLogs, setPitchLogs }) {
         </table>
       </div>
 
-      <Section title="Log Pitches">
-        <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
-          <select value={logPitcher} onChange={e => setLogPitcher(e.target.value)} style={{ ...inputStyle, minWidth: 130 }}>
-            <option value="">Pitcher...</option>
-            {pitchers.map(p => <option key={p.id} value={p.id}>#{p.number} {p.name}</option>)}
-          </select>
-          <input type="number" placeholder="Pitches" value={logPitches} onChange={e => setLogPitches(e.target.value)} min={1} max={75} style={{ ...inputStyle, width: 80 }} />
-          <input type="date" value={logDate} onChange={e => setLogDate(e.target.value)} style={inputStyle} />
-          <input placeholder="Opponent" value={logOpponent} onChange={e => setLogOpponent(e.target.value)} style={{ ...inputStyle, flex: "1 1 80px" }} />
-          <button onClick={addLog} style={{ ...chipStyle, background: C.accent, color: "#fff", borderColor: C.accent, padding: "8px 18px", fontWeight: 600 }}>Log</button>
-        </div>
-      </Section>
+      {canEdit && (
+        <Section title="Log Pitches">
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+            <select value={logPitcher} onChange={e => setLogPitcher(e.target.value)} style={{ ...inputStyle, minWidth: 130 }}>
+              <option value="">Pitcher...</option>
+              {pitchers.map(p => <option key={p.id} value={p.id}>#{p.number} {p.name}</option>)}
+            </select>
+            <input type="number" placeholder="Pitches" value={logPitches} onChange={e => setLogPitches(e.target.value)} min={1} max={75} style={{ ...inputStyle, width: 80 }} />
+            <input type="date" value={logDate} onChange={e => setLogDate(e.target.value)} style={inputStyle} />
+            <input placeholder="Opponent" value={logOpponent} onChange={e => setLogOpponent(e.target.value)} style={{ ...inputStyle, flex: "1 1 80px" }} />
+            <button onClick={addLog} style={{ ...chipStyle, background: C.accent, color: "#fff", borderColor: C.accent, padding: "8px 18px", fontWeight: 600 }}>Log</button>
+          </div>
+        </Section>
+      )}
 
       {pitchLogs.length > 0 && (
         <Section title={`Pitch Log (${pitchLogs.length})`} defaultOpen={false}>
@@ -2353,7 +2155,7 @@ function ArmCareTab({ roster, pitchLogs, setPitchLogs }) {
                 <span style={{ color: C.accent, fontWeight: 600 }}>{l.pitches}pc</span>
                 <span style={{ color: C.textMuted }}>{l.date}</span>
                 <span style={{ color: C.textMuted, flex: 1 }}>{l.opponent || ""}</span>
-                <button onClick={() => deleteLog(l.id)} style={{ ...miniChipStyle, color: C.red, borderColor: C.red, fontSize: 10, padding: "2px 6px" }}>&times;</button>
+                {canEdit && <button onClick={() => deleteLog(l.id)} style={{ ...miniChipStyle, color: C.red, borderColor: C.red, fontSize: 10, padding: "2px 6px" }}>&times;</button>}
               </div>
             );
           })}
@@ -2577,7 +2379,7 @@ function SetupTab({ roster, availablePlayers, absentIds, setAbsentIds, pitcherAs
 // ══════════════════════════════════════════════════
 // LINEUP TAB (with swap, finalize, PNG, color summary)
 // ══════════════════════════════════════════════════
-function LineupTab({ grid, setGrid, posHistory, benchCount, roster, warnings, innings, pitcherAssignments, catcherAssignments, benchTiers, gameMeta, isFinalized, setIsFinalized, generationId, pins = [], setPins = () => {}, onSolve, isSolving, onRevalidate, onBack }) {
+function LineupTab({ grid, setGrid, posHistory, benchCount, roster, warnings, innings, pitcherAssignments, catcherAssignments, benchTiers, gameMeta, isFinalized, setIsFinalized, generationId, pins = [], setPins = () => {}, onSolve, isSolving, onRevalidate, onBack, canEdit = true }) {
   const [swapSel, setSwapSel] = useState(null); // { innIdx, key, playerId }
   const [tickerIdx, setTickerIdx] = useState(0);
   const [dismissedMsgs, setDismissedMsgs] = useState(new Set());
@@ -2660,7 +2462,7 @@ function LineupTab({ grid, setGrid, posHistory, benchCount, roster, warnings, in
     return (
       <div style={{ textAlign: "center", padding: 48, color: C.textMuted }}>
         <div style={{ fontFamily: DISPLAY, fontSize: 18, marginBottom: 12 }}>No lineup generated yet</div>
-        <button onClick={onBack} style={{ ...chipStyle, background: C.accent, color: "#fff", borderColor: C.accent, padding: "8px 20px" }}>Go to Setup</button>
+        {canEdit && <button onClick={onBack} style={{ ...chipStyle, background: C.accent, color: "#fff", borderColor: C.accent, padding: "8px 20px" }}>Go to Setup</button>}
       </div>
     );
   }
@@ -2702,6 +2504,7 @@ function LineupTab({ grid, setGrid, posHistory, benchCount, roster, warnings, in
   };
 
   const handleCellClick = (innIdx, key, playerId) => {
+    if (!canEdit) return;
     if (isFinalized) return;
     // Pin mode short-circuits swap behavior: clicking a filled cell toggles its pin.
     // Pitcher/Catcher cells are non-pinnable (driven by setup plan) and fall through
@@ -3017,7 +2820,7 @@ function LineupTab({ grid, setGrid, posHistory, benchCount, roster, warnings, in
   return (
     <div>
       {/* Validation ticker — sticky at top so you can cycle through issues while swapping */}
-      {activeTicker && (() => {
+      {canEdit && activeTicker && (() => {
         const sevColor = activeTicker.severity === "high" ? C.red : activeTicker.severity === "med" ? C.orange : C.textMuted;
         const sevBg = activeTicker.severity === "high" ? "#fde8e8" : activeTicker.severity === "med" ? C.orangeLight : C.surfaceAlt;
         const sevLabel = activeTicker.severity === "high" ? "HIGH" : activeTicker.severity === "med" ? "MED" : "LOW";
@@ -3053,7 +2856,7 @@ function LineupTab({ grid, setGrid, posHistory, benchCount, roster, warnings, in
       )}
 
       {/* Interaction mode toggle + pin/solve controls */}
-      {!isFinalized && (
+      {canEdit && !isFinalized && (
         <div style={{ marginBottom: 12, display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
           {/* Mode segmented control */}
           <div style={{ display: "inline-flex", border: `1px solid ${C.border}`, borderRadius: 6, overflow: "hidden" }}>
@@ -3285,15 +3088,15 @@ function LineupTab({ grid, setGrid, posHistory, benchCount, roster, warnings, in
 
       {/* Action buttons */}
       <div style={{ display: "flex", justifyContent: "center", gap: 12, marginTop: 28, flexWrap: "wrap" }}>
-        <button onClick={onBack} style={{ ...chipStyle, padding: "10px 28px", background: C.surface, borderColor: C.accent, color: C.accent, fontSize: 14, fontWeight: 600 }}>{"\u2190"} Back to Setup</button>
+        <button onClick={onBack} style={{ ...chipStyle, padding: "10px 28px", background: C.surface, borderColor: C.accent, color: C.accent, fontSize: 14, fontWeight: 600 }}>{"\u2190"} {canEdit ? "Back to Setup" : "Back to Schedule"}</button>
         <button onClick={handlePrintGrid} style={{ ...chipStyle, padding: "10px 28px", fontSize: 14, fontWeight: 600 }}>Print Grid</button>
         <button onClick={handleExportJSON} style={{ ...chipStyle, padding: "10px 28px", fontSize: 14, fontWeight: 600 }}>Export JSON</button>
         <button onClick={handleExportGameDay} style={{ ...chipStyle, padding: "10px 28px", fontSize: 14, fontWeight: 600 }}>Game Day</button>
-        {!isFinalized ? (
+        {canEdit && (!isFinalized ? (
           <button onClick={handleFinalize} style={{ padding: "10px 28px", background: C.accent, color: "#fff", border: "none", borderRadius: 6, fontFamily: FONT, fontSize: 14, fontWeight: 600, cursor: "pointer", boxShadow: "0 4px 14px rgba(107,127,94,0.3)" }}>Finalize Lineup</button>
         ) : (
           <button onClick={handleEdit} style={{ ...chipStyle, padding: "10px 28px", borderColor: C.orange, color: C.orange, fontSize: 14, fontWeight: 600 }}>Unlock &amp; Edit</button>
-        )}
+        ))}
       </div>
     </div>
   );
@@ -3329,7 +3132,7 @@ const inputStyle = { background: C.surfaceAlt, border: `1px solid ${C.border}`, 
 // game cells show vs/@ Opponent + chosen pitchers (or "no lineup"). Tapping a
 // game cell loads the entry into the active editing state via onOpenGame.
 // ══════════════════════════════════════════════════
-function ScheduleTab({ schedule, setSchedule, roster, onOpenGame }) {
+function ScheduleTab({ schedule, setSchedule, roster, onOpenGame, canEdit = true }) {
   const months = [
     { year: 2026, monthIdx: 4, label: "May 2026" },
     { year: 2026, monthIdx: 5, label: "June 2026" },
@@ -3436,7 +3239,11 @@ function ScheduleTab({ schedule, setSchedule, roster, onOpenGame }) {
     <div>
       <div style={{ marginBottom: 22 }}>
         <h2 style={{ fontFamily: DISPLAY, fontSize: 24, fontWeight: 700, color: C.text, marginBottom: 4 }}>Schedule</h2>
-        <div style={{ fontSize: 13, color: C.textMuted }}>Tap a day to add a game. Tap a game to open or generate its lineup.</div>
+        <div style={{ fontSize: 13, color: C.textMuted }}>
+          {canEdit
+            ? "Tap a day to add a game. Tap a game to open or generate its lineup."
+            : "Tap a game to view its lineup. Sign in as a coach to edit."}
+        </div>
       </div>
       {months.map(m => (
         <MonthGrid key={m.label}
@@ -3444,9 +3251,10 @@ function ScheduleTab({ schedule, setSchedule, roster, onOpenGame }) {
           dayHeaders={dayHeaders} byDate={byDate}
           pitcherNames={pitcherNames}
           onAdd={openAdd} onEdit={openEdit} onOpen={onOpenGame}
+          canEdit={canEdit}
         />
       ))}
-      {editorOpen && (
+      {editorOpen && canEdit && (
         <ScheduleEditorModal
           mode={editorMode} kind={editorKind} date={editorDate}
           opponent={editorOpponent} setOpponent={setEditorOpponent}
@@ -3460,7 +3268,7 @@ function ScheduleTab({ schedule, setSchedule, roster, onOpenGame }) {
   );
 }
 
-function MonthGrid({ year, monthIdx, label, dayHeaders, byDate, pitcherNames, onAdd, onEdit, onOpen }) {
+function MonthGrid({ year, monthIdx, label, dayHeaders, byDate, pitcherNames, onAdd, onEdit, onOpen, canEdit = true }) {
   const firstOfMonth = new Date(year, monthIdx, 1);
   const lastOfMonth = new Date(year, monthIdx + 1, 0);
   const startCol = firstOfMonth.getDay();
@@ -3486,6 +3294,19 @@ function MonthGrid({ year, monthIdx, label, dayHeaders, byDate, pitcherNames, on
           if (c.kind === "blank") return <div key={c.key} style={{ minHeight: 110 }} />;
           const entry = byDate[c.date];
           if (!entry) {
+            if (!canEdit) {
+              // Read-only: empty days are inert. Same dimensions so the grid
+              // doesn't reflow between coach and parent views.
+              return (
+                <div key={c.key} style={{
+                  minHeight: 110, padding: "8px 10px",
+                  background: C.surfaceAlt, border: `1px dashed ${C.border}`, borderRadius: 8,
+                  fontFamily: FONT, color: C.textLight,
+                }}>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: C.textLight }}>{c.day}</div>
+                </div>
+              );
+            }
             return (
               <button key={c.key} onClick={() => onAdd(c.date)} style={{
                 minHeight: 110, padding: "8px 10px",
@@ -3503,11 +3324,11 @@ function MonthGrid({ year, monthIdx, label, dayHeaders, byDate, pitcherNames, on
           }
           if (entry.kind === "practice") {
             return (
-              <div key={c.key} onClick={() => onEdit(entry)} style={{
+              <div key={c.key} onClick={canEdit ? () => onEdit(entry) : undefined} style={{
                 minHeight: 110, padding: "8px 10px",
                 background: C.orangeLight,
                 border: `1px solid ${C.orange}`,
-                borderRadius: 8, cursor: "pointer",
+                borderRadius: 8, cursor: canEdit ? "pointer" : "default",
                 display: "flex", flexDirection: "column", gap: 4,
               }}>
                 <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{c.day}</div>
@@ -3528,11 +3349,11 @@ function MonthGrid({ year, monthIdx, label, dayHeaders, byDate, pitcherNames, on
             }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
                 <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{c.day}</div>
-                <button onClick={(e) => { e.stopPropagation(); onEdit(entry); }} style={{
+                {canEdit && <button onClick={(e) => { e.stopPropagation(); onEdit(entry); }} style={{
                   background: "rgba(255,255,255,0.6)", border: `1px solid ${C.border}`,
                   padding: "1px 6px", cursor: "pointer", color: C.textMuted,
                   fontSize: 11, lineHeight: 1.2, borderRadius: 4,
-                }} title="Edit game">edit</button>
+                }} title="Edit game">edit</button>}
               </div>
               <div style={{ fontSize: 13, fontWeight: 600, color: C.text, lineHeight: 1.3, wordBreak: "break-word" }}>{oppLabel}</div>
               <div style={{ fontSize: 11, color: hasLineup ? C.greenText : C.textMuted, lineHeight: 1.3, fontStyle: hasLineup ? "normal" : "italic", wordBreak: "break-word" }}>
