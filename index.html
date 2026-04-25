@@ -9,6 +9,7 @@
   <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
   <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
   <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body { background: #f5f3ef; }
@@ -144,8 +145,88 @@ const DEFAULT_ROSTER = [
   { id:"13", name:"Strachan", number:"15", positionMap:{ P:"preferred","2B":"preferred",SS:"secondary:2",C:"emergency:2" } },
 ];
 
-function load(k, fb) { try { const r = localStorage.getItem(k); return r ? JSON.parse(r) : fb; } catch { return fb; } }
-function save(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} }
+// ══════════════════════════════════════════════════
+// SUPABASE CLOUD SYNC
+// ══════════════════════════════════════════════════
+// Strategy: keep the load(k, fb) / save(k, v) API identical so the rest of
+// the 3,400-line app doesn't change. Reads come from an in-memory cache that
+// is hydrated from Supabase on boot (with localStorage as offline fallback).
+// Writes go to localStorage immediately (so the UI stays snappy) AND queue a
+// write to Supabase if the user is signed in. Anyone (no auth) can VIEW data
+// via the public-read RLS policy; only signed-in coaches can persist changes.
+const SUPABASE_URL = "https://aeyxvqtelsihvxxxpifo.supabase.co";
+const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFleXh2cXRlbHNpaHZ4eHhwaWZvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzcxMzMzMDMsImV4cCI6MjA5MjcwOTMwM30.6ZMj4sMaFFTBMOENRByYkkgKWFamYaJcG8to0XFsV34";
+
+const sb = window.supabase
+  ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
+  : null;
+
+// In-memory cache. Hydrated from Supabase on boot, kept in sync on writes.
+// Reads from this cache are synchronous so load(k, fb) preserves its API.
+const cloudCache = {};
+let cloudReady = false;
+const cloudListeners = new Set();
+function notifyCloudReady() { cloudListeners.forEach(fn => { try { fn(); } catch {} }); }
+
+async function hydrateFromCloud() {
+  if (!sb) { cloudReady = true; notifyCloudReady(); return; }
+  try {
+    const { data, error } = await sb.from("team_state").select("key, value");
+    if (error) throw error;
+    if (data) data.forEach(row => { cloudCache[row.key] = row.value; });
+  } catch (e) {
+    console.warn("Cloud hydrate failed, using local cache:", e.message);
+  }
+  cloudReady = true;
+  notifyCloudReady();
+}
+hydrateFromCloud();
+
+// Per-key write queue. Coalesces rapid saves (e.g. typing in a name field
+// fires many saves). Each key has at most one pending and one in-flight write.
+const writeQueue = {};
+async function pushToCloud(key, value) {
+  if (!sb) return;
+  const { data: { session } } = await sb.auth.getSession();
+  if (!session) return; // viewers don't write
+  const { error } = await sb.from("team_state").upsert(
+    { key, value, updated_at: new Date().toISOString(), updated_by: session.user.id },
+    { onConflict: "key" }
+  );
+  if (error) console.warn("Cloud save failed for", key, error.message);
+}
+function queueCloudWrite(key, value) {
+  if (!sb) return;
+  if (writeQueue[key]?.inFlight) {
+    writeQueue[key].pending = value;
+    return;
+  }
+  writeQueue[key] = { inFlight: true, pending: null };
+  (async () => {
+    let v = value;
+    while (true) {
+      await pushToCloud(key, v);
+      const next = writeQueue[key].pending;
+      if (next === null) { writeQueue[key].inFlight = false; return; }
+      writeQueue[key].pending = null;
+      v = next;
+    }
+  })();
+}
+
+// Public load/save — same signature as before. Reads cloud cache first (with
+// localStorage as fallback for first-load before hydration completes); writes
+// go to both localStorage (instant, offline-safe) and the cloud queue.
+function load(k, fb) {
+  if (k in cloudCache) return cloudCache[k];
+  try { const r = localStorage.getItem(k); return r ? JSON.parse(r) : fb; }
+  catch { return fb; }
+}
+function save(k, v) {
+  cloudCache[k] = v;
+  try { localStorage.setItem(k, JSON.stringify(v)); } catch {}
+  queueCloudWrite(k, v);
+}
 // positionMap values may be bare tiers ("preferred") or tier-with-rank ("secondary:2").
 // Rank breaks ties within a tier (1 = top). Missing rank defaults to 1.
 function playerTier(player, pos) {
@@ -1604,9 +1685,106 @@ function generatePNG(grid, posHistory, roster, innings) {
 }
 
 // ══════════════════════════════════════════════════
+// LOGIN BAR
+// ══════════════════════════════════════════════════
+// Compact auth UI rendered in the top header. Three states:
+//   1. Not signed in → "Sign in" button (parents/players see this; read-only)
+//   2. Signed in → email pill + "Sign out" link (coaches see this; can edit)
+//   3. Sign-in modal → email + password form
+// Sign-up is intentionally not exposed in the UI — coaches are invited by
+// email from the Supabase dashboard, which delivers a "set your password"
+// link. This keeps the team's editor list tightly controlled.
+function LoginBar({ session, onChange }) {
+  const [open, setOpen] = useState(false);
+  const [email, setEmail] = useState("");
+  const [pw, setPw] = useState("");
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  async function signIn() {
+    setBusy(true); setErr("");
+    const { error } = await sb.auth.signInWithPassword({ email, password: pw });
+    setBusy(false);
+    if (error) { setErr(error.message); return; }
+    setOpen(false); setEmail(""); setPw("");
+  }
+  async function signOut() {
+    await sb.auth.signOut();
+  }
+
+  if (!sb) return null;
+
+  return (
+    <>
+      <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 8 }}>
+        {session ? (
+          <>
+            <span style={{ fontSize: 11, color: C.textMuted, background: C.surfaceAlt, padding: "4px 8px", borderRadius: 4, border: `1px solid ${C.border}`, maxWidth: 160, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {session.user.email}
+            </span>
+            <button onClick={signOut} style={{ fontSize: 11, color: C.textMuted, background: "transparent", border: "none", cursor: "pointer", padding: "4px 6px" }}>
+              Sign out
+            </button>
+          </>
+        ) : (
+          <button onClick={() => setOpen(true)} style={{ fontSize: 12, color: C.surface, background: C.accent, border: "none", padding: "6px 12px", borderRadius: 4, cursor: "pointer", fontWeight: 600 }}>
+            Coach sign in
+          </button>
+        )}
+      </div>
+      {open && (
+        <div onClick={() => setOpen(false)} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.4)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
+          <div onClick={(e) => e.stopPropagation()} style={{ background: C.surface, borderRadius: 8, padding: 20, maxWidth: 320, width: "100%", boxShadow: "0 4px 16px rgba(0,0,0,0.15)" }}>
+            <h2 style={{ fontFamily: DISPLAY, fontSize: 18, marginBottom: 4, color: C.text }}>Coach sign in</h2>
+            <p style={{ fontSize: 12, color: C.textMuted, marginBottom: 16 }}>
+              Use the email and password from your invitation.
+            </p>
+            <input type="email" placeholder="Email" value={email} onChange={(e) => setEmail(e.target.value)}
+              style={{ width: "100%", padding: "8px 10px", fontSize: 14, border: `1px solid ${C.border}`, borderRadius: 4, marginBottom: 8, fontFamily: FONT }} />
+            <input type="password" placeholder="Password" value={pw} onChange={(e) => setPw(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") signIn(); }}
+              style={{ width: "100%", padding: "8px 10px", fontSize: 14, border: `1px solid ${C.border}`, borderRadius: 4, marginBottom: 12, fontFamily: FONT }} />
+            {err && <div style={{ fontSize: 12, color: C.redText, background: C.redLight, padding: "6px 8px", borderRadius: 4, marginBottom: 12 }}>{err}</div>}
+            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+              <button onClick={() => setOpen(false)} style={{ fontSize: 13, color: C.textMuted, background: "transparent", border: `1px solid ${C.border}`, padding: "6px 12px", borderRadius: 4, cursor: "pointer" }}>
+                Cancel
+              </button>
+              <button onClick={signIn} disabled={busy || !email || !pw} style={{ fontSize: 13, color: C.surface, background: C.accent, border: "none", padding: "6px 12px", borderRadius: 4, cursor: busy ? "default" : "pointer", fontWeight: 600, opacity: (busy || !email || !pw) ? 0.5 : 1 }}>
+                {busy ? "Signing in..." : "Sign in"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
+// ══════════════════════════════════════════════════
 // APP
 // ══════════════════════════════════════════════════
 function App() {
+  // Auth session — null when not signed in, populated when a coach signs in.
+  // Drives the LoginBar display and gates write-back to Supabase.
+  const [session, setSession] = useState(null);
+  // Bumped when cloud hydration completes so all the load(...) initializers
+  // re-run with fresh data. Also bumped on sign-in / sign-out so the app picks
+  // up any changes made by other coaches while we were viewing.
+  const [cloudGen, setCloudGen] = useState(0);
+
+  useEffect(() => {
+    if (!sb) return;
+    sb.auth.getSession().then(({ data }) => setSession(data.session));
+    const { data: sub } = sb.auth.onAuthStateChange((_evt, sess) => {
+      setSession(sess);
+      // Re-hydrate so signed-in coaches see the latest server state
+      hydrateFromCloud().then(() => setCloudGen(g => g + 1));
+    });
+    const onReady = () => setCloudGen(g => g + 1);
+    cloudListeners.add(onReady);
+    return () => { sub?.subscription?.unsubscribe(); cloudListeners.delete(onReady); };
+  }, []);
+
   const [roster, setRoster] = useState(() => {
     const storedVer = load("dugout_roster_version", 0);
     if (storedVer < ROSTER_VERSION) {
@@ -1663,6 +1841,28 @@ function App() {
     gameType: "season",
   }));
   useEffect(() => { save("dugout_gameMeta", gameMeta); }, [gameMeta]);
+
+  // When cloud cache hydrates (or re-hydrates after sign-in), refresh state
+  // from the cache. Skip cloudGen=0 because the useState initializers above
+  // already read from load() on first mount — we only react to subsequent
+  // hydrations. Without this, a coach signing in would still see the stale
+  // pre-auth state until they refreshed the page.
+  const cloudGenRef = useRef(0);
+  useEffect(() => {
+    if (cloudGen === 0) { cloudGenRef.current = 0; return; }
+    if (cloudGen === cloudGenRef.current) return;
+    cloudGenRef.current = cloudGen;
+    const cloudRoster = load("dugout_roster", null);
+    if (cloudRoster) setRoster(cloudRoster);
+    const cloudPitchLogs = load("dugout_pitchLogs", null);
+    if (cloudPitchLogs) setPitchLogs(cloudPitchLogs);
+    const cloudSchedule = load("dugout_schedule", null);
+    if (cloudSchedule) setSchedule(cloudSchedule);
+    const cloudBenchTiers = load("dugout_benchTiers", null);
+    if (cloudBenchTiers) setBenchTiers(cloudBenchTiers);
+    const cloudGameMeta = load("dugout_gameMeta", null);
+    if (cloudGameMeta) setGameMeta(cloudGameMeta);
+  }, [cloudGen]);
 
   // Transient: id of the schedule entry the user is currently editing. Set
   // when they click into a game from the calendar; null for a one-off lineup
@@ -1848,6 +2048,7 @@ function App() {
       <div style={{ background: C.surface, borderBottom: `1px solid ${C.border}`, padding: "16px 20px", display: "flex", alignItems: "center", boxShadow: "0 1px 3px rgba(0,0,0,0.04)" }}>
         <span style={{ fontFamily: DISPLAY, fontSize: 22, fontWeight: 700, color: C.accent }}>Dugout</span>
         <span style={{ fontSize: 12, color: C.textMuted, fontWeight: 500, marginLeft: 10 }}>11U OBA</span>
+        <LoginBar session={session} onChange={setSession} />
       </div>
       <div style={{ display: "flex", background: C.surface, borderBottom: `1px solid ${C.border}`, overflowX: "auto" }}>
         {tabs.map(t => (
