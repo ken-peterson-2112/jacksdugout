@@ -154,8 +154,82 @@ const DEFAULT_ROSTER = [
   { id:"13", name:"Strachan", number:"15", positionMap:{ P:"preferred","2B":"preferred",SS:"secondary:2",C:"emergency:2" } },
 ];
 
-function load(k, fb) { try { const r = localStorage.getItem(k); return r ? JSON.parse(r) : fb; } catch { return fb; } }
-function save(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} }
+// ══════════════════════════════════════════════════
+// CLOUD DATA LAYER
+// load / save preserve their localStorage signatures so the rest of the app
+// doesn't change. Reads come from an in-memory cache hydrated from the
+// team_data row on sign-in (with localStorage as offline fallback). Writes
+// update localStorage immediately AND queue an upsert to the cloud once
+// hydration is done. Keys not in KEY_TO_COLUMN (e.g. version flags) are
+// localStorage-only.
+// ══════════════════════════════════════════════════
+const KEY_TO_COLUMN = {
+  "dugout_roster":     "roster",
+  "dugout_pitchLogs":  "pitch_logs",
+  "dugout_schedule":   "schedule",
+  "dugout_benchTiers": "bench_tiers",
+  "dugout_gameMeta":   "game_meta",
+};
+const cloudCache = {};
+// Set to true once a hydrate completes. Until then, save() doesn't push to
+// the cloud — otherwise the useState initializers' default-resets would
+// race the hydrate fetch and overwrite the team's real data.
+let cloudReady = false;
+
+async function hydrateFromCloud() {
+  const { data, error } = await supabase
+    .from("team_data")
+    .select("roster, schedule, pitch_logs, bench_tiers, game_meta")
+    .eq("id", 1)
+    .maybeSingle();
+  if (error) console.warn("Cloud hydrate failed:", error.message);
+  else if (data) {
+    for (const [key, column] of Object.entries(KEY_TO_COLUMN)) {
+      if (data[column] != null) cloudCache[key] = data[column];
+    }
+  }
+  cloudReady = true;
+}
+
+const writeQueue = {};
+async function pushToCloud(key, value) {
+  const column = KEY_TO_COLUMN[key];
+  if (!column) return;
+  const { error } = await supabase
+    .from("team_data")
+    .update({ [column]: value, updated_at: new Date().toISOString() })
+    .eq("id", 1);
+  if (error) console.warn("Cloud save failed for", key, error.message);
+}
+function queueCloudWrite(key, value) {
+  if (!KEY_TO_COLUMN[key] || !cloudReady) return;
+  if (writeQueue[key]?.inFlight) {
+    writeQueue[key].pending = value;
+    return;
+  }
+  writeQueue[key] = { inFlight: true, pending: null };
+  (async () => {
+    let v = value;
+    while (true) {
+      await pushToCloud(key, v);
+      const next = writeQueue[key].pending;
+      if (next === null) { writeQueue[key].inFlight = false; return; }
+      writeQueue[key].pending = null;
+      v = next;
+    }
+  })();
+}
+
+function load(k, fb) {
+  if (k in cloudCache) return cloudCache[k];
+  try { const r = localStorage.getItem(k); return r ? JSON.parse(r) : fb; }
+  catch { return fb; }
+}
+function save(k, v) {
+  if (k in KEY_TO_COLUMN) cloudCache[k] = v;
+  try { localStorage.setItem(k, JSON.stringify(v)); } catch {}
+  queueCloudWrite(k, v);
+}
 // positionMap values may be bare tiers ("preferred") or tier-with-rank ("secondary:2").
 // Rank breaks ties within a tier (1 = top). Missing rank defaults to 1.
 function playerTier(player, pos) {
@@ -1700,6 +1774,11 @@ function App() {
   // the app renders the LoginScreen instead of the main UI.
   const [session, setSession] = useState(null);
   const [authChecked, setAuthChecked] = useState(false);
+  // hydrated = true once we've fetched the team_data row. Main app waits on it.
+  const [hydrated, setHydrated] = useState(false);
+  // True when this device's localStorage holds data the cloud doesn't have.
+  // Drives the import-to-cloud banner above the main content.
+  const [showImportBanner, setShowImportBanner] = useState(false);
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => {
@@ -1708,6 +1787,13 @@ function App() {
     });
     const { data: sub } = supabase.auth.onAuthStateChange((_evt, sess) => {
       setSession(sess);
+      if (!sess) {
+        // Sign-out: drop hydration so next sign-in re-fetches.
+        setHydrated(false);
+        setShowImportBanner(false);
+        cloudReady = false;
+        for (const k of Object.keys(cloudCache)) delete cloudCache[k];
+      }
     });
     return () => sub?.subscription?.unsubscribe();
   }, []);
@@ -1768,6 +1854,57 @@ function App() {
     gameType: "season",
   }));
   useEffect(() => { save("dugout_gameMeta", gameMeta); }, [gameMeta]);
+
+  // Hydrate from Supabase once the user signs in. After the fetch completes,
+  // override React state with cloud values — but only when the cloud has
+  // real data. If cloud is empty (fresh project), leave the localStorage /
+  // DEFAULT_ROSTER initial state alone so the import banner can offer to
+  // push it up.
+  useEffect(() => {
+    if (!session || cloudReady) return;
+    hydrateFromCloud().then(() => {
+      // If the cloud has *any* data, treat cloud as source of truth — sync
+      // every field, even empties (so deletions made on other devices
+      // propagate). If the cloud is fully empty (fresh project), leave local
+      // state alone so the import banner can offer to push it up.
+      const r  = cloudCache["dugout_roster"];
+      const pl = cloudCache["dugout_pitchLogs"];
+      const sc = cloudCache["dugout_schedule"];
+      const bt = cloudCache["dugout_benchTiers"];
+      const gm = cloudCache["dugout_gameMeta"];
+      const cloudHasAnyData =
+        (Array.isArray(r) && r.length > 0) ||
+        (Array.isArray(pl) && pl.length > 0) ||
+        (Array.isArray(sc) && sc.length > 0) ||
+        (bt && typeof bt === "object" && Object.keys(bt).length > 0) ||
+        (gm && typeof gm === "object" && Object.keys(gm).length > 0);
+
+      if (cloudHasAnyData) {
+        if (Array.isArray(r))  setRoster(r.length > 0 ? r : DEFAULT_ROSTER);
+        if (Array.isArray(pl)) setPitchLogs(pl);
+        if (Array.isArray(sc)) setSchedule(sc);
+        if (bt && typeof bt === "object") setBenchTiers(Object.keys(bt).length > 0 ? bt : DEFAULT_BENCH_TIERS);
+        if (gm && typeof gm === "object" && Object.keys(gm).length > 0) setGameMeta(gm);
+      } else {
+        // Cloud is empty. Offer to import this device's data if it has any.
+        let localRoster = null;
+        try { localRoster = JSON.parse(localStorage.getItem("dugout_roster") || "null"); } catch {}
+        if (Array.isArray(localRoster) && localRoster.length > 0) setShowImportBanner(true);
+      }
+      setHydrated(true);
+    });
+  }, [session]);
+
+  // Push every cloud-mapped key from this device's localStorage up to the
+  // team_data row. Used by the import banner.
+  const handleImportToCloud = () => {
+    for (const k of Object.keys(KEY_TO_COLUMN)) {
+      let v = null;
+      try { v = JSON.parse(localStorage.getItem(k) || "null"); } catch {}
+      if (v != null) save(k, v);
+    }
+    setShowImportBanner(false);
+  };
 
   // Transient: id of the schedule entry the user is currently editing. Set
   // when they click into a game from the calendar; null for a one-off lineup
@@ -1952,6 +2089,13 @@ function App() {
     return <div style={{ background: C.bg, minHeight: "100vh" }} />;
   }
   if (!session) return <LoginScreen />;
+  if (!hydrated) {
+    return (
+      <div style={{ background: C.bg, minHeight: "100vh", fontFamily: FONT, color: C.textMuted, display: "flex", alignItems: "center", justifyContent: "center" }}>
+        <div style={{ fontSize: 14 }}>Loading team data…</div>
+      </div>
+    );
+  }
 
   return (
     <div style={{ background: C.bg, minHeight: "100vh", fontFamily: FONT, color: C.text }}>
@@ -1979,6 +2123,17 @@ function App() {
         ))}
       </div>
       <div style={{ maxWidth: 920, margin: "0 auto", padding: "20px 16px" }}>
+        {showImportBanner && (
+          <div style={{ background: C.blueLight, border: `1px solid ${C.blue}`, borderRadius: 8, padding: "12px 16px", marginBottom: 16, display: "flex", alignItems: "center", gap: 12, fontSize: 13, color: C.text, flexWrap: "wrap" }}>
+            <div style={{ flex: "1 1 240px", lineHeight: 1.4 }}>
+              <strong>Local data found.</strong> This device has a roster the cloud doesn't. Import it so all coaches can see it.
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button onClick={() => setShowImportBanner(false)} style={{ background: C.surface, border: `1px solid ${C.border}`, color: C.text, padding: "6px 12px", borderRadius: 6, fontFamily: FONT, fontSize: 12, fontWeight: 500, cursor: "pointer" }}>Not now</button>
+              <button onClick={handleImportToCloud} style={{ background: C.accent, border: `1px solid ${C.accent}`, color: "#fff", padding: "6px 12px", borderRadius: 6, fontFamily: FONT, fontSize: 12, fontWeight: 600, cursor: "pointer" }}>Import to cloud</button>
+            </div>
+          </div>
+        )}
         {tab === "schedule" && <ScheduleTab schedule={schedule} setSchedule={setSchedule} roster={sortedRoster} onOpenGame={handleOpenScheduleEntry} />}
         {tab === "armcare" && <ArmCareTab roster={sortedRoster} pitchLogs={pitchLogs} setPitchLogs={setPitchLogs} />}
         {tab === "roster" && <RosterTab roster={sortedRoster} setRoster={setRoster} />}
