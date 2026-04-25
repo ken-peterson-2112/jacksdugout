@@ -26,6 +26,15 @@
 const { useState, useEffect, useMemo, useCallback, useRef } = React;
 
 // ══════════════════════════════════════════════════
+// SUPABASE CLIENT
+// Anon key is public by design; row-level security in the database
+// (see schema SQL) is what actually protects team data.
+// ══════════════════════════════════════════════════
+const SUPABASE_URL = "https://oewaghxnwqzeneavontg.supabase.co";
+const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9ld2FnaHhud3F6ZW5lYXZvbnRnIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzcxNDAxNzcsImV4cCI6MjA5MjcxNjE3N30.Y1aEbQkl2YSU964905nYKO9J9AnomaZMnvpG_Ika9kk";
+const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+// ══════════════════════════════════════════════════
 // GAME-DAY EXPORT TEMPLATE
 // Base64-encoded HTML template for the standalone game-day file.
 // At export time we decode this, substitute \_\_GAME_TITLE\_\_ and \_\_GAME_DATA\_\_,
@@ -1605,9 +1614,104 @@ function generatePNG(grid, posHistory, roster, innings) {
 }
 
 // ══════════════════════════════════════════════════
+// LOGIN SCREEN
+// Magic-link auth: enter email → click link in inbox → signed in.
+// ══════════════════════════════════════════════════
+function LoginScreen() {
+  const [email, setEmail] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [sent, setSent] = useState(false);
+  const [error, setError] = useState("");
+
+  const handleSendLink = async () => {
+    const e = email.trim();
+    if (!e) return;
+    setLoading(true);
+    setError("");
+    const { error: err } = await supabase.auth.signInWithOtp({
+      email: e,
+      options: { emailRedirectTo: window.location.href },
+    });
+    setLoading(false);
+    if (err) setError(err.message);
+    else setSent(true);
+  };
+
+  return (
+    <div style={{ background: C.bg, minHeight: "100vh", fontFamily: FONT, color: C.text, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
+      <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, padding: 32, maxWidth: 380, width: "100%", boxShadow: "0 1px 3px rgba(0,0,0,0.04)" }}>
+        <div style={{ marginBottom: 24, textAlign: "center" }}>
+          <div style={{ fontFamily: DISPLAY, fontSize: 28, fontWeight: 700, color: C.accent, marginBottom: 4 }}>Dugout</div>
+          <div style={{ fontSize: 12, color: C.textMuted, fontWeight: 500 }}>11U OBA</div>
+        </div>
+        {sent ? (
+          <div style={{ textAlign: "center" }}>
+            <div style={{ fontSize: 14, fontWeight: 600, color: C.text, marginBottom: 8 }}>Check your email</div>
+            <div style={{ fontSize: 13, color: C.textMuted, lineHeight: 1.5 }}>
+              We sent a sign-in link to<br />
+              <strong style={{ color: C.text }}>{email}</strong>
+            </div>
+            <button onClick={() => { setSent(false); setEmail(""); }} style={{ marginTop: 20, fontSize: 12, color: C.textMuted, background: "transparent", border: "none", cursor: "pointer", textDecoration: "underline" }}>
+              Use a different email
+            </button>
+          </div>
+        ) : (
+          <React.Fragment>
+            <label style={{ fontSize: 11, fontWeight: 600, color: C.textMuted, textTransform: "uppercase", letterSpacing: 0.5, display: "block", marginBottom: 6 }}>Coach email</label>
+            <input
+              type="email"
+              value={email}
+              onChange={e => setEmail(e.target.value)}
+              placeholder="you@example.com"
+              autoFocus
+              onKeyDown={(e) => { if (e.key === "Enter" && email.trim()) handleSendLink(); }}
+              style={{ width: "100%", padding: "10px 12px", border: `1px solid ${C.border}`, borderRadius: 6, fontFamily: FONT, fontSize: 14, color: C.text, background: C.surfaceAlt, marginBottom: 12 }}
+            />
+            <button
+              onClick={handleSendLink}
+              disabled={loading || !email.trim()}
+              style={{
+                width: "100%", padding: "10px 16px", borderRadius: 6, fontFamily: FONT, fontSize: 14, fontWeight: 600,
+                background: (loading || !email.trim()) ? C.borderLight : C.accent,
+                color: (loading || !email.trim()) ? C.textMuted : "#fff",
+                border: `1px solid ${(loading || !email.trim()) ? C.border : C.accent}`,
+                cursor: (loading || !email.trim()) ? "not-allowed" : "pointer",
+              }}
+            >
+              {loading ? "Sending..." : "Send sign-in link"}
+            </button>
+            {error && (
+              <div style={{ marginTop: 12, fontSize: 12, color: C.redText, background: C.redLight, padding: "8px 10px", borderRadius: 4 }}>
+                {error}
+              </div>
+            )}
+          </React.Fragment>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════
 // APP
 // ══════════════════════════════════════════════════
 function App() {
+  // Auth session — null until the user signs in via magic link. While null,
+  // the app renders the LoginScreen instead of the main UI.
+  const [session, setSession] = useState(null);
+  const [authChecked, setAuthChecked] = useState(false);
+
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data }) => {
+      setSession(data.session);
+      setAuthChecked(true);
+    });
+    const { data: sub } = supabase.auth.onAuthStateChange((_evt, sess) => {
+      setSession(sess);
+    });
+    return () => sub?.subscription?.unsubscribe();
+  }, []);
+
   const [roster, setRoster] = useState(() => {
     const storedVer = load("dugout_roster_version", 0);
     if (storedVer < ROSTER_VERSION) {
@@ -1844,11 +1948,24 @@ function App() {
     { id:"lineup",   label:"Lineup" },
   ];
 
+  if (!authChecked) {
+    return <div style={{ background: C.bg, minHeight: "100vh" }} />;
+  }
+  if (!session) return <LoginScreen />;
+
   return (
     <div style={{ background: C.bg, minHeight: "100vh", fontFamily: FONT, color: C.text }}>
       <div style={{ background: C.surface, borderBottom: `1px solid ${C.border}`, padding: "16px 20px", display: "flex", alignItems: "center", boxShadow: "0 1px 3px rgba(0,0,0,0.04)" }}>
         <span style={{ fontFamily: DISPLAY, fontSize: 22, fontWeight: 700, color: C.accent }}>Dugout</span>
         <span style={{ fontSize: 12, color: C.textMuted, fontWeight: 500, marginLeft: 10 }}>11U OBA</span>
+        <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ fontSize: 11, color: C.textMuted, background: C.surfaceAlt, padding: "4px 8px", borderRadius: 4, border: `1px solid ${C.border}`, maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            {session.user.email}
+          </span>
+          <button onClick={() => supabase.auth.signOut()} style={{ fontSize: 11, color: C.textMuted, background: "transparent", border: "none", cursor: "pointer", padding: "4px 6px" }}>
+            Sign out
+          </button>
+        </div>
       </div>
       <div style={{ display: "flex", background: C.surface, borderBottom: `1px solid ${C.border}`, overflowX: "auto" }}>
         {tabs.map(t => (
