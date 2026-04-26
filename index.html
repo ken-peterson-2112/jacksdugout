@@ -26,6 +26,15 @@
 const { useState, useEffect, useMemo, useCallback, useRef } = React;
 
 // ══════════════════════════════════════════════════
+// AUTH GATE TOGGLE
+// Flip to true to re-enable the magic-link login screen and Supabase
+// cloud sync. While false, the app skips auth entirely and persists
+// to localStorage only — useful for fast iteration without burning
+// magic-link emails against the rate limit.
+// ══════════════════════════════════════════════════
+const REQUIRE_AUTH = false;
+
+// ══════════════════════════════════════════════════
 // SUPABASE CLIENT
 // Anon key is public by design; row-level security in the database
 // (see schema SQL) is what actually protects team data.
@@ -73,8 +82,12 @@ function getRestLabel(pc) {
 
 // ══════════════════════════════════════════════════
 // DESIGN TOKENS
+// `C` is a mutable object — `applyTheme` overwrites its contents in place
+// when the user toggles dark mode. Components reference `C.x` inline in
+// their styles, which evaluate at render time, so a re-render after a
+// theme swap picks up the new values automatically.
 // ══════════════════════════════════════════════════
-const C = {
+const C_LIGHT = {
   bg: "#f5f3ef", surface: "#ffffff", surfaceAlt: "#f9f7f4",
   border: "#e2ddd5", borderLight: "#ece8e1",
   text: "#3d3832", textMuted: "#8c8478", textLight: "#b0a89d",
@@ -85,6 +98,33 @@ const C = {
   blue: "#6088a0", blueLight: "#e8f0f4",
   tierGreen: "#6b8f5e", tierYellow: "#d4a82c", tierOrange: "#cc5a28",
 };
+const C_DARK = {
+  bg: "#1a1a17", surface: "#252521", surfaceAlt: "#2c2c27",
+  border: "#3a3a32", borderLight: "#33332c",
+  text: "#e8e3d8", textMuted: "#a39e91", textLight: "#6a6a5f",
+  accent: "#8fb37e", accentDark: "#6b8f5e", accentLight: "#33402a",
+  green: "#8fb37e", greenLight: "#2d3a26", greenText: "#a8c898",
+  red: "#d08d7d", redLight: "#3a2825", redText: "#e0a89a",
+  orange: "#d4a872", orangeLight: "#3a2f22",
+  blue: "#88a5b8", blueLight: "#2a323a",
+  tierGreen: "#8fb37e", tierYellow: "#d4a82c", tierOrange: "#cc5a28",
+};
+const C = { ...C_LIGHT };
+function applyTheme(name) {
+  const src = name === "dark" ? C_DARK : C_LIGHT;
+  for (const k of Object.keys(src)) C[k] = src[k];
+  // Rebuild the shared style objects (declared further down) so any place
+  // that spreads `{...chipStyle, ...}` etc. picks up the new palette. These
+  // objects are captured by reference everywhere they're used, so mutating
+  // them in place is enough — components re-render and read the new values.
+  if (typeof chipStyle !== "undefined") {
+    Object.assign(chipStyle,     { border: `1px solid ${C.border}`, background: C.surface,    color: C.text });
+    Object.assign(miniChipStyle, { border: `1px solid ${C.border}`, background: C.surface,    color: C.text });
+    Object.assign(thStyle,       { color: C.textMuted, borderBottom: `2px solid ${C.border}`, background: C.surfaceAlt });
+    Object.assign(tdStyle,       { borderBottom: `1px solid ${C.borderLight}` });
+    Object.assign(inputStyle,    { background: C.surfaceAlt, border: `1px solid ${C.border}`, color: C.text });
+  }
+}
 const FONT = "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
 const DISPLAY = "'Georgia', 'Times New Roman', serif";
 
@@ -1770,6 +1810,23 @@ function LoginScreen() {
 // APP
 // ══════════════════════════════════════════════════
 function App() {
+  // Theme. Apply synchronously in the lazy initializer so the very first
+  // render reads the right palette (otherwise we'd flash light-then-dark).
+  const [theme, setTheme] = useState(() => {
+    const t = load("dugout_theme", "light");
+    applyTheme(t);
+    return t;
+  });
+  useEffect(() => {
+    save("dugout_theme", theme);
+    document.body.style.background = theme === "dark" ? C_DARK.bg : C_LIGHT.bg;
+  }, [theme]);
+  const toggleTheme = () => {
+    const next = theme === "dark" ? "light" : "dark";
+    applyTheme(next);
+    setTheme(next);
+  };
+
   // Auth session — null until the user signs in via magic link. While null,
   // the app renders the LoginScreen instead of the main UI.
   const [session, setSession] = useState(null);
@@ -1781,6 +1838,13 @@ function App() {
   const [showImportBanner, setShowImportBanner] = useState(false);
 
   useEffect(() => {
+    if (!REQUIRE_AUTH) {
+      // Bypass: skip auth + cloud hydration; render the app immediately
+      // backed by localStorage only.
+      setAuthChecked(true);
+      setHydrated(true);
+      return;
+    }
     supabase.auth.getSession().then(({ data }) => {
       setSession(data.session);
       setAuthChecked(true);
@@ -1928,23 +1992,85 @@ function App() {
 
   const availablePlayers = useMemo(() => sortedRoster.filter(p => !absentIds.includes(p.id)), [sortedRoster, absentIds]);
 
-  const today = new Date().toISOString().slice(0, 10);
+  // Pitcher availability is computed against the date of the game being
+  // planned (gameMeta.date), not the wall-clock today. That way re-opening
+  // a past game gives the right answer for that game's date, and forward
+  // planning naturally uses the future date as the reference.
+  //
+  // Hard block (`available: false`): only when a LOGGED pitchLogs entry in
+  // the past 7 days requires rest beyond the gap between then and the
+  // planning date. This matches the user's rule: "only block based on
+  // actual innings pitched in past games that have been logged."
+  //
+  // Soft warnings (`warnings`): planned-but-not-logged scheduled appearances
+  // that touch the rest window. Surfaced in the UI as info, never blocking.
+  //   - "sameday": another game on the same date (tournaments)
+  //   - "pastplanned": earlier game that was planned but never logged
+  //   - "future": upcoming game whose rest window the planning date falls in
   const pitcherAvailability = useMemo(() => {
     const result = {};
+    const planningDate = gameMeta.date || (new Date().toISOString().slice(0, 10));
+    const planningTs = new Date(planningDate + "T12:00:00").getTime();
+
     roster.forEach(p => {
       if (!p.positionMap?.P) return;
+
+      // Hard block: rest from logged past outings within the 7-day window.
       const logs = pitchLogs.filter(l => l.playerId === p.id);
-      const recent = logs.filter(l => { const d = (new Date(today) - new Date(l.date)) / 86400000; return d >= 0 && d <= 7; });
-      if (recent.length === 0) { result[p.id] = { available: true, reason: "No recent pitching", last7: 0 }; return; }
-      const lastLog = recent.sort((a, b) => b.date.localeCompare(a.date))[0];
-      const restNeeded = getRestDays(lastLog.pitches);
-      const daysSince = Math.floor((new Date(today) - new Date(lastLog.date)) / 86400000);
-      const restRemaining = Math.max(0, restNeeded - daysSince);
-      const last7 = recent.reduce((s, l) => s + l.pitches, 0);
-      result[p.id] = { available: restRemaining === 0, reason: restRemaining > 0 ? `${restRemaining}d rest remaining` : "Available", restRemaining, last7 };
+      const recentLogs = logs.filter(l => {
+        const days = (planningTs - new Date(l.date + "T12:00:00").getTime()) / 86400000;
+        return days >= 0 && days <= 7;
+      });
+      let restRemaining = 0;
+      let blockReason = null;
+      let last7 = 0;
+      if (recentLogs.length > 0) {
+        const lastLog = recentLogs.sort((a, b) => b.date.localeCompare(a.date))[0];
+        const daysSince = Math.floor((planningTs - new Date(lastLog.date + "T12:00:00").getTime()) / 86400000);
+        const restNeeded = getRestDays(lastLog.pitches);
+        restRemaining = Math.max(0, restNeeded - daysSince);
+        if (restRemaining > 0) blockReason = "Unavailable";
+        last7 = recentLogs.reduce((s, l) => s + l.pitches, 0);
+      }
+
+      // Soft warnings from scheduled-but-not-yet-logged appearances.
+      const warnings = [];
+      schedule.forEach(g => {
+        if (g.id === currentScheduleId) return;
+        if (!g.lineup || !Array.isArray(g.lineup.pitcherAssignments)) return;
+        const assigned = g.lineup.pitcherAssignments.find(pa => pa.id === p.id);
+        if (!assigned) return;
+        // If actuals were logged for this game already, the pitchLogs check
+        // above already covers it — skip the planned version to avoid double-counting.
+        const alreadyLogged = pitchLogs.some(l => l.scheduleId === g.id && l.playerId === p.id);
+        if (alreadyLogged) return;
+        const dayDiff = Math.floor((new Date(g.date + "T12:00:00").getTime() - planningTs) / 86400000);
+        const oppLabel = g.opponent ? ` vs ${g.opponent}` : "";
+        if (dayDiff === 0) {
+          warnings.push({ type: "sameday", burden: assigned.budget, dayDiff: 0,
+            msg: `${assigned.budget} planned same-day${oppLabel}` });
+        } else if (dayDiff < 0) {
+          const restNeeded = getRestDays(assigned.budget);
+          const daysAgo = -dayDiff;
+          if (daysAgo < restNeeded) {
+            warnings.push({ type: "pastplanned", burden: assigned.budget, dayDiff,
+              msg: `${assigned.budget} planned ${daysAgo}d ago${oppLabel} (not yet logged)` });
+          }
+        } else if (dayDiff > 0 && dayDiff <= 4) {
+          warnings.push({ type: "future", burden: assigned.budget, dayDiff,
+            msg: `${assigned.budget} planned in ${dayDiff}d${oppLabel}` });
+        }
+      });
+
+      const available = restRemaining === 0;
+      const reason = blockReason
+        || (warnings.length > 0 ? warnings[0].msg
+          : (last7 > 0 ? `Available · ${last7}pc/7d` : "Available"));
+
+      result[p.id] = { available, reason, restRemaining, last7, warnings, hasWarnings: warnings.length > 0 };
     });
     return result;
-  }, [roster, pitchLogs, today]);
+  }, [roster, pitchLogs, schedule, gameMeta.date, currentScheduleId]);
 
   // Recompute posHistory/benchCount from editableGrid
   const computed = useMemo(() => {
@@ -1974,6 +2100,26 @@ function App() {
     setIsFinalized(false);
     setPins([]); // fresh generation \u2192 clear any prior pins
     setGenerationId(g => g + 1);
+
+    // If this lineup wasn't opened from a calendar entry but the coach has
+    // filled in date + opponent on the Setup tab, register it on the calendar
+    // so the game shows up alongside everything else (rather than living as a
+    // detached one-off lineup).
+    if (!currentScheduleId && gameMeta.opponent && gameMeta.opponent.trim() && gameMeta.date) {
+      const newId = "sch_" + Date.now() + "_" + Math.floor(Math.random() * 1000);
+      setSchedule(prev => [...prev, {
+        id: newId,
+        date: gameMeta.date,
+        kind: "game",
+        opponent: gameMeta.opponent.trim(),
+        homeAway: gameMeta.homeAway || "home",
+        time: gameMeta.time || null,
+        gameType: gameMeta.gameType || "season",
+      }]);
+      setCurrentScheduleId(newId);
+      // The mirror effect picks up from here and writes the lineup into the entry.
+    }
+
     setTab("lineup");
   };
 
@@ -2026,6 +2172,7 @@ function App() {
       date: entry.date,
       opponent: entry.opponent || "",
       homeAway: entry.homeAway || "home",
+      time: entry.time || "",
       gameType: entry.gameType || prev.gameType || "season",
     }));
     setCurrentScheduleId(entry.id);
@@ -2063,6 +2210,7 @@ function App() {
         date: gameMeta.date || prev[idx].date,
         opponent: gameMeta.opponent ?? prev[idx].opponent,
         homeAway: gameMeta.homeAway || prev[idx].homeAway,
+        time: gameMeta.time !== undefined ? (gameMeta.time || null) : prev[idx].time,
         gameType: gameMeta.gameType || prev[idx].gameType,
         lineup: editableGrid ? {
           grid: editableGrid,
@@ -2077,6 +2225,46 @@ function App() {
     });
   }, [currentScheduleId, gameMeta, editableGrid, pitcherAssignments, catcherAssignments, absentIds, gameInnings, isFinalized]);
 
+  // Logs already recorded for the active schedule entry. Used to pre-fill the
+  // "Log pitches" modal so re-opening shows actual counts (not planned budget).
+  const pitchLogsForGame = useMemo(
+    () => currentScheduleId ? pitchLogs.filter(l => l.scheduleId === currentScheduleId) : [],
+    [pitchLogs, currentScheduleId]
+  );
+  const currentScheduleEntry = useMemo(
+    () => currentScheduleId ? schedule.find(e => e.id === currentScheduleId) : null,
+    [schedule, currentScheduleId]
+  );
+  const isPlayed = !!currentScheduleEntry?.played;
+
+  // Save handler for the "Log pitches" modal: replaces this game's pitch logs
+  // and flips the entry's played flag so the calendar can mark it.
+  const handleSavePitchLog = (entries) => {
+    if (!currentScheduleId) return;
+    const valid = entries.filter(e => {
+      if (e.pitches === "" || e.pitches == null) return false;
+      const n = parseInt(e.pitches, 10);
+      return !Number.isNaN(n) && n >= 0;
+    }).map(e => ({ playerId: e.playerId, pitches: parseInt(e.pitches, 10) }));
+
+    setPitchLogs(prev => {
+      const filtered = prev.filter(l => l.scheduleId !== currentScheduleId);
+      const created = valid.map(v => ({
+        id: "pl_" + Date.now() + "_" + v.playerId + "_" + Math.floor(Math.random() * 1000),
+        playerId: v.playerId,
+        pitches: v.pitches,
+        date: gameMeta.date,
+        opponent: gameMeta.opponent || "",
+        scheduleId: currentScheduleId,
+      }));
+      return [...filtered, ...created];
+    });
+
+    setSchedule(prev => prev.map(e =>
+      e.id === currentScheduleId ? { ...e, played: valid.length > 0 } : e
+    ));
+  };
+
   const tabs = [
     { id:"schedule", label:"Schedule" },
     { id:"roster",   label:"Roster" },
@@ -2088,7 +2276,7 @@ function App() {
   if (!authChecked) {
     return <div style={{ background: C.bg, minHeight: "100vh" }} />;
   }
-  if (!session) return <LoginScreen />;
+  if (REQUIRE_AUTH && !session) return <LoginScreen />;
   if (!hydrated) {
     return (
       <div style={{ background: C.bg, minHeight: "100vh", fontFamily: FONT, color: C.textMuted, display: "flex", alignItems: "center", justifyContent: "center" }}>
@@ -2103,12 +2291,25 @@ function App() {
         <span style={{ fontFamily: DISPLAY, fontSize: 22, fontWeight: 700, color: C.accent }}>Dugout</span>
         <span style={{ fontSize: 12, color: C.textMuted, fontWeight: 500, marginLeft: 10 }}>11U OBA</span>
         <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 8 }}>
-          <span style={{ fontSize: 11, color: C.textMuted, background: C.surfaceAlt, padding: "4px 8px", borderRadius: 4, border: `1px solid ${C.border}`, maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-            {session.user.email}
-          </span>
-          <button onClick={() => supabase.auth.signOut()} style={{ fontSize: 11, color: C.textMuted, background: "transparent", border: "none", cursor: "pointer", padding: "4px 6px" }}>
-            Sign out
-          </button>
+          <button onClick={toggleTheme} title={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"} style={{
+            fontSize: 14, color: C.textMuted, background: "transparent",
+            border: `1px solid ${C.border}`, cursor: "pointer",
+            padding: "4px 8px", borderRadius: 4, lineHeight: 1, fontFamily: FONT,
+          }}>{theme === "dark" ? "☀" : "☾"}</button>
+          {session ? (
+            <React.Fragment>
+              <span style={{ fontSize: 11, color: C.textMuted, background: C.surfaceAlt, padding: "4px 8px", borderRadius: 4, border: `1px solid ${C.border}`, maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                {session.user.email}
+              </span>
+              <button onClick={() => supabase.auth.signOut()} style={{ fontSize: 11, color: C.textMuted, background: "transparent", border: "none", cursor: "pointer", padding: "4px 6px" }}>
+                Sign out
+              </button>
+            </React.Fragment>
+          ) : (
+            <span title="Auth gate disabled in source — flip REQUIRE_AUTH back to true to require login" style={{ fontSize: 11, color: C.orange, background: C.orangeLight, padding: "4px 8px", borderRadius: 4, border: `1px solid ${C.orange}`, fontWeight: 600 }}>
+              Test mode
+            </span>
+          )}
         </div>
       </div>
       <div style={{ display: "flex", background: C.surface, borderBottom: `1px solid ${C.border}`, overflowX: "auto" }}>
@@ -2146,13 +2347,18 @@ function App() {
           onGenerate={handleGenerate} />}
         {tab === "lineup" && <LineupTab grid={editableGrid} setGrid={setEditableGrid}
           posHistory={computed.posHistory} benchCount={computed.benchCount}
-          roster={availablePlayers} warnings={warnings} innings={gameInnings}
+          roster={availablePlayers} fullRoster={sortedRoster}
+          warnings={warnings} innings={gameInnings}
           pitcherAssignments={pitcherAssignments} catcherAssignments={catcherAssignments}
           benchTiers={benchTiers} gameMeta={gameMeta}
           isFinalized={isFinalized} setIsFinalized={setIsFinalized}
           generationId={generationId}
           pins={pins} setPins={setPins}
           onSolve={handleSolve} isSolving={isSolving}
+          isLinkedToSchedule={!!currentScheduleId}
+          isPlayed={isPlayed}
+          pitchLogsForGame={pitchLogsForGame}
+          onSavePitchLog={handleSavePitchLog}
           onRevalidate={() => {
             if (!editableGrid) return;
             const w = validateLineup(editableGrid, computed.posHistory, availablePlayers, gameInnings, benchTiers);
@@ -2335,18 +2541,26 @@ function ArmCareTab({ roster, pitchLogs, setPitchLogs, canEdit = true }) {
   const [logDate, setLogDate] = useState(new Date().toISOString().slice(0, 10));
   const [logOpponent, setLogOpponent] = useState("");
   const [rulesOpen, setRulesOpen] = useState(false);
-  const today = new Date().toISOString().slice(0, 10);
+  // "As-of" date: defaults to wall-clock today but the coach can scrub to any
+  // date to see what the team's pitch state would have looked like / will look
+  // like on that day.
+  const wallClockToday = new Date().toISOString().slice(0, 10);
+  const [today, setToday] = useState(wallClockToday);
   const pitchers = roster.filter(p => p.positionMap?.P);
 
   const pitcherData = useMemo(() => pitchers.map(p => {
     const logs = pitchLogs.filter(l => l.playerId === p.id);
     const daysAgo = (d) => Math.floor((new Date(today) - new Date(d)) / 86400000);
-    const last7 = logs.filter(l => daysAgo(l.date) <= 7).reduce((s, l) => s + l.pitches, 0);
-    const last14 = logs.filter(l => daysAgo(l.date) <= 14).reduce((s, l) => s + l.pitches, 0);
-    const last30 = logs.filter(l => daysAgo(l.date) <= 30).reduce((s, l) => s + l.pitches, 0);
-    const recent = logs.filter(l => daysAgo(l.date) <= 7).sort((a, b) => b.date.localeCompare(a.date));
+    // Past-only: future-dated logs are ignored across the totals so the
+    // 7d/14d/30d numbers stay consistent with the Status column.
+    const last7  = logs.filter(l => { const d = daysAgo(l.date); return d >= 0 && d <= 7;  }).reduce((s, l) => s + l.pitches, 0);
+    const last14 = logs.filter(l => { const d = daysAgo(l.date); return d >= 0 && d <= 14; }).reduce((s, l) => s + l.pitches, 0);
+    const last30 = logs.filter(l => { const d = daysAgo(l.date); return d >= 0 && d <= 30; }).reduce((s, l) => s + l.pitches, 0);
+    // Only consider logs at or before today — future-dated logs would
+    // produce a negative `daysAgo` and inflate the rest math.
+    const recent = logs.filter(l => { const d = daysAgo(l.date); return d >= 0 && d <= 7; }).sort((a, b) => b.date.localeCompare(a.date));
     let available = true, restRemaining = 0, reason = "Available";
-    if (recent.length > 0) { const ll = recent[0]; const rn = getRestDays(ll.pitches); const ds = daysAgo(ll.date); restRemaining = Math.max(0, rn - ds); available = restRemaining === 0; reason = available ? "Available" : `${restRemaining}d rest`; }
+    if (recent.length > 0) { const ll = recent[0]; const rn = getRestDays(ll.pitches); const ds = daysAgo(ll.date); restRemaining = Math.max(0, rn - ds); available = restRemaining === 0; reason = available ? "Available" : "Unavailable"; }
     const avail = ARM_CARE.dailyMax - logs.filter(l => l.date === today).reduce((s, l) => s + l.pitches, 0);
     return { ...p, last7, last14, last30, available, restRemaining, reason, availToday: Math.max(0, avail) };
   }), [pitchers, pitchLogs, today]);
@@ -2364,8 +2578,24 @@ function ArmCareTab({ roster, pitchLogs, setPitchLogs, canEdit = true }) {
   const deleteLog = (id) => setPitchLogs(prev => prev.filter(l => l.id !== id));
   const sortHeader = (label, col, width) => <th onClick={() => toggleSort(col)} style={{ ...thStyle, cursor: "pointer", width, userSelect: "none" }}>{label} {sortCol === col ? (sortDir === "asc" ? "\u25B2" : "\u25BC") : ""}</th>;
 
+  const todayLabel = (() => {
+    try {
+      const d = new Date(today + "T12:00:00");
+      return d.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric", year: "numeric" });
+    } catch { return today; }
+  })();
+
   return (
     <div>
+      <div style={{ fontSize: 12, color: C.textMuted, marginBottom: 10, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+        <span>Status, rest, and totals as of</span>
+        <input type="date" value={today} onChange={e => setToday(e.target.value || wallClockToday)}
+          style={{ background: C.surfaceAlt, border: `1px solid ${C.border}`, color: C.text, padding: "3px 8px", borderRadius: 6, fontFamily: FONT, fontSize: 12, outline: "none" }} />
+        <span style={{ color: C.text, fontWeight: 600 }}>({todayLabel})</span>
+        {today !== wallClockToday && (
+          <button onClick={() => setToday(wallClockToday)} style={{ ...miniChipStyle, fontSize: 11, padding: "2px 8px" }}>Reset to today</button>
+        )}
+      </div>
       <div style={{ overflowX: "auto", marginBottom: 20, borderRadius: 8, boxShadow: "0 1px 4px rgba(0,0,0,0.06)" }}>
         <table style={{ width: "100%", borderCollapse: "collapse", background: C.surface, borderRadius: 8 }}>
           <thead><tr>
@@ -2443,10 +2673,10 @@ function ArmCareTab({ roster, pitchLogs, setPitchLogs, canEdit = true }) {
           <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderTop: "none", borderRadius: "0 0 8px 8px", padding: 18, fontSize: 13, color: C.textMuted, lineHeight: 2 }}>
             <div style={{ display: "grid", gridTemplateColumns: "auto 1fr", gap: "2px 20px" }}>
               <span style={{ color: C.accent, fontWeight: 600 }}>Daily max:</span><span>75 pitches</span>
-              <span style={{ color: C.accent, fontWeight: 600 }}>0 days rest:</span><span>1\u201324 pitches</span>
-              <span style={{ color: C.accent, fontWeight: 600 }}>1 day rest:</span><span>25\u201334 pitches</span>
-              <span style={{ color: C.accent, fontWeight: 600 }}>2 days rest:</span><span>35\u201354 pitches</span>
-              <span style={{ color: C.accent, fontWeight: 600 }}>3 days rest:</span><span>55\u201374 pitches</span>
+              <span style={{ color: C.accent, fontWeight: 600 }}>0 days rest:</span><span>{"1\u201324 pitches"}</span>
+              <span style={{ color: C.accent, fontWeight: 600 }}>1 day rest:</span><span>{"25\u201334 pitches"}</span>
+              <span style={{ color: C.accent, fontWeight: 600 }}>2 days rest:</span><span>{"35\u201354 pitches"}</span>
+              <span style={{ color: C.accent, fontWeight: 600 }}>3 days rest:</span><span>{"55\u201374 pitches"}</span>
               <span style={{ color: C.accent, fontWeight: 600 }}>4 days rest:</span><span>75 pitches</span>
               <span style={{ color: C.accent, fontWeight: 600 }}>Consecutive:</span><span>Max 3 days, never 4</span>
               <span style={{ color: C.accent, fontWeight: 600 }}>Catcher rule:</span><span>Pitcher cannot catch remainder of game</span>
@@ -2495,10 +2725,26 @@ function SetupTab({ roster, availablePlayers, absentIds, setAbsentIds, pitcherAs
             <input type="date" value={gameMeta.date || ""} onChange={e => updateMeta("date", e.target.value)}
               style={{ fontFamily: FONT, fontSize: 13, padding: "6px 10px", border: `1px solid ${C.border}`, borderRadius: 6, background: C.surface, color: C.text }} />
           </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+            <label style={{ fontSize: 12, color: C.textMuted, fontWeight: 500 }}>Time (optional)</label>
+            <input type="time" value={gameMeta.time || ""} onChange={e => updateMeta("time", e.target.value)}
+              style={{ fontFamily: FONT, fontSize: 13, padding: "6px 10px", border: `1px solid ${C.border}`, borderRadius: 6, background: C.surface, color: C.text }} />
+          </div>
           <div style={{ display: "flex", flexDirection: "column", gap: 4, flex: 1, minWidth: 180 }}>
             <label style={{ fontSize: 12, color: C.textMuted, fontWeight: 500 }}>Opponent</label>
             <input type="text" value={gameMeta.opponent || ""} onChange={e => updateMeta("opponent", e.target.value)} placeholder="e.g. Burlington Bulls"
               style={{ fontFamily: FONT, fontSize: 13, padding: "6px 10px", border: `1px solid ${C.border}`, borderRadius: 6, background: C.surface, color: C.text }} />
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 4, flexBasis: "100%" }}>
+            <label style={{ fontSize: 12, color: C.textMuted, fontWeight: 500 }}>Home / Away</label>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+              {[{id:"home", label:"Home (vs)"}, {id:"away", label:"Away (@)"}].map(opt => (
+                <button key={opt.id} onClick={() => updateMeta("homeAway", opt.id)}
+                  style={{ ...chipStyle, background: (gameMeta.homeAway || "home") === opt.id ? C.accent : C.surface, color: (gameMeta.homeAway || "home") === opt.id ? "#fff" : C.text, borderColor: (gameMeta.homeAway || "home") === opt.id ? C.accent : C.border, padding: "6px 14px" }}>
+                  {opt.label}
+                </button>
+              ))}
+            </div>
           </div>
           <div style={{ display: "flex", flexDirection: "column", gap: 4, flexBasis: "100%" }}>
             <label style={{ fontSize: 12, color: C.textMuted, fontWeight: 500 }}>Game Type</label>
@@ -2544,15 +2790,30 @@ function SetupTab({ roster, availablePlayers, absentIds, setAbsentIds, pitcherAs
               <span style={{ fontWeight: 600, minWidth: 80, fontSize: 14 }}>{player?.name}</span>
               <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
                 <label style={{ fontSize: 12, color: C.textMuted }}>Inn:</label>
-                {[1,2,3,4].map(n => <button key={n} onClick={() => updatePitcher(pa.id, "innings", n)} style={{ ...miniChipStyle, background: pa.innings === n ? C.accent : C.surface, color: pa.innings === n ? "#fff" : C.textMuted, borderColor: pa.innings === n ? C.accent : C.border }}>{n}</button>)}
+                {[1,2,3,4,5,6,7].map(n => <button key={n} onClick={() => updatePitcher(pa.id, "innings", n)} style={{ ...miniChipStyle, background: pa.innings === n ? C.accent : C.surface, color: pa.innings === n ? "#fff" : C.textMuted, borderColor: pa.innings === n ? C.accent : C.border }}>{n}</button>)}
               </div>
               <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
                 <label style={{ fontSize: 12, color: C.textMuted }}>Budget:</label>
                 {ARM_CARE.budgetOptions.map(b => <button key={b} onClick={() => updatePitcher(pa.id, "budget", b)} style={{ ...miniChipStyle, background: pa.budget === b ? C.blue : C.surface, color: pa.budget === b ? "#fff" : C.textMuted, borderColor: pa.budget === b ? C.blue : C.border, fontSize: 11 }}>{b}</button>)}
               </div>
-              {avail && <span style={{ fontSize: 11, padding: "3px 8px", borderRadius: 12, background: avail.available ? C.greenLight : C.redLight, color: avail.available ? C.greenText : C.redText, fontWeight: 600 }}>{avail.available ? `${avail.last7}pc/7d` : avail.reason}</span>}
+              {avail && (
+                <span style={{
+                  fontSize: 11, padding: "3px 8px", borderRadius: 12, fontWeight: 600,
+                  background: !avail.available ? C.redLight : avail.hasWarnings ? C.orangeLight : C.greenLight,
+                  color:      !avail.available ? C.redText  : avail.hasWarnings ? C.orange      : C.greenText,
+                }}>{avail.available ? `${avail.last7}pc/7d` : avail.reason}</span>
+              )}
               <span style={{ fontSize: 11, color: C.textMuted }}>{"\u2192"} {getRestLabel(pa.budget)} rest</span>
               <button onClick={() => removePitcher(pa.id)} style={{ ...miniChipStyle, color: C.red, borderColor: C.red, marginLeft: "auto" }}>&times;</button>
+              {avail && avail.warnings && avail.warnings.length > 0 && (
+                <div style={{ flexBasis: "100%", display: "flex", flexDirection: "column", gap: 2, marginLeft: 32, marginTop: -4 }}>
+                  {avail.warnings.map((w, i) => (
+                    <span key={i} style={{ fontSize: 11, color: C.orange, fontWeight: 500 }}>
+                      <span style={{ marginRight: 4 }}>{"\u26a0"}</span>{w.msg}
+                    </span>
+                  ))}
+                </div>
+              )}
             </div>
           );
         })}
@@ -2562,8 +2823,18 @@ function SetupTab({ roster, availablePlayers, absentIds, setAbsentIds, pitcherAs
             {pitchEligible.filter(p => !pitcherAssignments.some(pa => pa.id === p.id)).map(p => {
               const avail = pitcherAvailability[p.id];
               const isAvail = avail?.available !== false;
-              return <button key={p.id} onClick={() => isAvail && addPitcher(p.id)} style={{ ...chipStyle, padding: "6px 12px", opacity: isAvail ? 1 : 0.45, cursor: isAvail ? "pointer" : "not-allowed", background: isAvail ? C.greenLight : C.redLight, borderColor: isAvail ? C.green : C.red, color: isAvail ? C.greenText : C.redText }}>
-                {p.name}{avail && !isAvail && <span style={{ fontSize: 10, marginLeft: 4 }}>({avail.reason})</span>}
+              const hasWarn = isAvail && avail?.hasWarnings;
+              const tip = avail?.warnings?.length > 0 ? avail.warnings.map(w => w.msg).join(" · ") : avail?.reason;
+              return <button key={p.id} onClick={() => isAvail && addPitcher(p.id)} title={tip || ""} style={{
+                  ...chipStyle, padding: "6px 12px",
+                  opacity: isAvail ? 1 : 0.45,
+                  cursor: isAvail ? "pointer" : "not-allowed",
+                  background:  !isAvail ? C.redLight : hasWarn ? C.orangeLight : C.greenLight,
+                  borderColor: !isAvail ? C.red      : hasWarn ? C.orange      : C.green,
+                  color:       !isAvail ? C.redText  : hasWarn ? C.orange      : C.greenText,
+                }}>
+                {hasWarn && <span style={{ marginRight: 4 }}>{"⚠"}</span>}{p.name}
+                {avail && !isAvail && <span style={{ fontSize: 10, marginLeft: 4 }}>({avail.reason})</span>}
               </button>;
             })}
           </div>
@@ -2651,11 +2922,13 @@ function SetupTab({ roster, availablePlayers, absentIds, setAbsentIds, pitcherAs
 // ══════════════════════════════════════════════════
 // LINEUP TAB (with swap, finalize, PNG, color summary)
 // ══════════════════════════════════════════════════
-function LineupTab({ grid, setGrid, posHistory, benchCount, roster, warnings, innings, pitcherAssignments, catcherAssignments, benchTiers, gameMeta, isFinalized, setIsFinalized, generationId, pins = [], setPins = () => {}, onSolve, isSolving, onRevalidate, onBack, canEdit = true }) {
+function LineupTab({ grid, setGrid, posHistory, benchCount, roster, fullRoster, warnings, innings, pitcherAssignments, catcherAssignments, benchTiers, gameMeta, isFinalized, setIsFinalized, generationId, pins = [], setPins = () => {}, onSolve, isSolving, isLinkedToSchedule = false, isPlayed = false, pitchLogsForGame = [], onSavePitchLog = () => {}, onRevalidate, onBack, canEdit = true }) {
+  const [pitchLogModalOpen, setPitchLogModalOpen] = useState(false);
   const [swapSel, setSwapSel] = useState(null); // { innIdx, key, playerId }
   const [tickerIdx, setTickerIdx] = useState(0);
   const [dismissedMsgs, setDismissedMsgs] = useState(new Set());
   const [tickerHidden, setTickerHidden] = useState(false);
+  const [validationOpen, setValidationOpen] = useState(false);
   const [lastGen, setLastGen] = useState(-1);
   // Interaction mode: "swap" (default) moves players within an inning; "pin"
   // locks a (player, pos, inning) triple so Solve Remaining won't touch it.
@@ -3094,7 +3367,7 @@ function LineupTab({ grid, setGrid, posHistory, benchCount, roster, warnings, in
       {/* Validation ticker — sticky at top so you can cycle through issues while swapping */}
       {canEdit && activeTicker && (() => {
         const sevColor = activeTicker.severity === "high" ? C.red : activeTicker.severity === "med" ? C.orange : C.textMuted;
-        const sevBg = activeTicker.severity === "high" ? "#fde8e8" : activeTicker.severity === "med" ? C.orangeLight : C.surfaceAlt;
+        const sevBg = activeTicker.severity === "high" ? C.redLight : activeTicker.severity === "med" ? C.orangeLight : C.surfaceAlt;
         const sevLabel = activeTicker.severity === "high" ? "HIGH" : activeTicker.severity === "med" ? "MED" : "LOW";
         return (
           <div style={{ position: "sticky", top: 0, zIndex: 20, background: sevBg, border: `1px solid ${sevColor}`, borderRadius: 8, padding: "10px 12px", marginBottom: 14, display: "flex", alignItems: "center", gap: 10, boxShadow: "0 2px 8px rgba(0,0,0,0.06)" }}>
@@ -3181,7 +3454,9 @@ function LineupTab({ grid, setGrid, posHistory, benchCount, roster, warnings, in
         </div>
       )}
 
-      {/* Validation panel (always visible so Refresh has a home even when clean) */}
+      {/* Validation panel \u2014 collapsed by default; tap title to expand. The
+          ticker above already surfaces high-severity issues one at a time, so
+          the full list is mostly a "give me everything" reference now. */}
       {(() => {
         const hasWarnings = sortedWarnings.length > 0;
         const panelBg = hasWarnings ? C.orangeLight : C.greenLight;
@@ -3190,15 +3465,18 @@ function LineupTab({ grid, setGrid, posHistory, benchCount, roster, warnings, in
         const stamp = lastValidatedAt
           ? `Checked ${lastValidatedAt.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`
           : "Auto-checked on swap";
+        const open = validationOpen;
         return (
-          <div style={{ background: panelBg, border: `1px solid ${panelBorder}`, borderRadius: 8, padding: 16, marginBottom: 20 }}>
-            <div style={{ fontSize: 12, fontWeight: 600, color: titleColor, marginBottom: hasWarnings ? 8 : 0, display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-              <span>
+          <div style={{ background: panelBg, border: `1px solid ${panelBorder}`, borderRadius: 8, padding: open ? 16 : "8px 14px", marginBottom: 20 }}>
+            <div onClick={() => setValidationOpen(o => !o)}
+              style={{ fontSize: 12, fontWeight: 600, color: titleColor, marginBottom: open && hasWarnings ? 8 : 0, display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, flexWrap: "wrap", cursor: "pointer", userSelect: "none" }}>
+              <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                <span style={{ fontSize: 10, transition: "transform .15s", display: "inline-block", transform: open ? "rotate(90deg)" : "rotate(0deg)" }}>{"\u25b6"}</span>
                 {hasWarnings
                   ? `Validation (${sortedWarnings.length}${dismissedMsgs.size > 0 ? `, ${dismissedMsgs.size} dismissed` : ""})`
                   : `Validation \u2014 no issues flagged`}
               </span>
-              <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+              <div style={{ display: "flex", gap: 6, alignItems: "center" }} onClick={(e) => e.stopPropagation()}>
                 <span style={{ fontSize: 10, color: C.textMuted, fontWeight: 500 }}>{stamp}</span>
                 {hasWarnings && (tickerHidden || visibleWarnings.length === 0) && (
                   <button onClick={() => { setTickerHidden(false); setDismissedMsgs(new Set()); setTickerIdx(0); }}
@@ -3208,7 +3486,7 @@ function LineupTab({ grid, setGrid, posHistory, benchCount, roster, warnings, in
                   style={{ ...miniChipStyle, fontSize: 11, padding: "2px 10px", fontWeight: 600 }}>{"\u21bb"} Refresh</button>
               </div>
             </div>
-            {hasWarnings && sortedWarnings.map((w, i) => {
+            {open && hasWarnings && sortedWarnings.map((w, i) => {
               const dismissed = dismissedMsgs.has(w.msg);
               return (
                 <div key={i} style={{ fontSize: 13, color: dismissed ? C.textMuted : (w.severity === "high" ? C.redText : w.severity === "med" ? C.orange : C.textMuted), padding: "3px 0", textDecoration: dismissed ? "line-through" : "none", opacity: dismissed ? 0.6 : 1 }}>
@@ -3246,11 +3524,12 @@ function LineupTab({ grid, setGrid, posHistory, benchCount, roster, warnings, in
                       return (
                         <td key={innIdx} onClick={() => handleCellClick(innIdx, key, pid)}
                           style={{ ...tdStyle, background: innIdx % 2 === 0 ? C.surface : C.surfaceAlt, ...cellClickStyle(innIdx, key, pid) }}>
+                          {player && <BenchScoreBadge count={benchCount[pid]} />}
                           {player && (
-                            <span style={{ display: "inline-flex", alignItems: "center", gap: 4, color: C.textLight, fontStyle: "italic", fontSize: 12 }}>
+                            <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 4, paddingRight: 18, color: C.textLight, fontStyle: "italic", fontSize: 12 }}>
                               {pinned && <span title="Pinned" style={{ color: "#c97b2c", fontSize: 11, fontStyle: "normal" }}>{"\u25CF"}</span>}
-                              {player.name}
-                            </span>
+                              <span>{player.name}</span>
+                            </div>
                           )}
                         </td>
                       );
@@ -3274,10 +3553,11 @@ function LineupTab({ grid, setGrid, posHistory, benchCount, roster, warnings, in
                     return (
                       <td key={innIdx} onClick={() => handleCellClick(innIdx, pos, pid)}
                         style={{ ...tdStyle, background: innIdx % 2 === 0 ? C.surface : C.surfaceAlt, ...cellClickStyle(innIdx, pos, pid) }}>
+                        {player && <BenchScoreBadge count={benchCount[pid]} />}
                         {player && (
-                          <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                          <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 5, paddingRight: 18 }}>
                             {tierColor && <span style={{ display: "inline-block", width: 6, height: 6, borderRadius: "50%", background: tierColor, flexShrink: 0 }} />}
-                            <span style={{ fontWeight: isCont ? 400 : 600, color: isCont ? C.textMuted : C.text, fontSize: isCont ? 12 : 13 }}>{player.name}</span>
+                            <span style={{ fontWeight: 600, color: C.text, fontSize: 13 }}>{player.name}</span>
                             {pinned && <span title="Pinned \u2014 Solve Remaining will not change this cell" style={{ marginLeft: "auto", color: "#c97b2c", fontSize: 11, fontWeight: 700 }}>{"\u25CF"}</span>}
                           </div>
                         )}
@@ -3321,7 +3601,7 @@ function LineupTab({ grid, setGrid, posHistory, benchCount, roster, warnings, in
                 return (
                   <tr key={p.id}>
                     <td style={{ ...tdStyle, background: ri % 2 ? C.surfaceAlt : C.surface, color: C.accent, fontWeight: 600, paddingLeft: 12 }}>{p.number}</td>
-                    <td style={{ ...tdStyle, background: ri % 2 ? C.surfaceAlt : C.surface, fontWeight: 600 }}>{p.name}</td>
+                    <td style={{ ...tdStyle, background: ri % 2 ? C.surfaceAlt : C.surface, fontWeight: 600, textAlign: "center" }}>{p.name}</td>
                     {Array.from({ length: innings }, (_, i) => {
                       const pos = history[i];
                       if (!pos) return <td key={i} style={{ ...tdStyle, background: ri % 2 ? C.surfaceAlt : C.surface }} />;
@@ -3333,7 +3613,11 @@ function LineupTab({ grid, setGrid, posHistory, benchCount, roster, warnings, in
                         </td>
                       );
                     })}
-                    <td style={{ ...tdStyle, background: ri % 2 ? C.surfaceAlt : C.surface, textAlign: "center", fontWeight: 600, color: overBench ? C.redText : C.textMuted }}>{bnCount}</td>
+                    <td style={{ ...tdStyle, background: ri % 2 ? C.surfaceAlt : C.surface, textAlign: "center", fontWeight: 600, color: overBench ? C.redText : C.textMuted, whiteSpace: "nowrap" }}>
+                      {bnCount === 2
+                        ? <span>{bnCount}</span>
+                        : <BenchScoreBadge count={bnCount} size="md" />}
+                    </td>
                   </tr>
                 );
               })}
@@ -3364,13 +3648,236 @@ function LineupTab({ grid, setGrid, posHistory, benchCount, roster, warnings, in
         <button onClick={handlePrintGrid} style={{ ...chipStyle, padding: "10px 28px", fontSize: 14, fontWeight: 600 }}>Print Grid</button>
         <button onClick={handleExportJSON} style={{ ...chipStyle, padding: "10px 28px", fontSize: 14, fontWeight: 600 }}>Export JSON</button>
         <button onClick={handleExportGameDay} style={{ ...chipStyle, padding: "10px 28px", fontSize: 14, fontWeight: 600 }}>Game Day</button>
+        {canEdit && isLinkedToSchedule && (
+          <button onClick={() => setPitchLogModalOpen(true)} style={{
+            ...chipStyle, padding: "10px 28px", fontSize: 14, fontWeight: 600,
+            background: isPlayed ? C.greenLight : C.surface,
+            borderColor: isPlayed ? C.green : C.border,
+            color: isPlayed ? C.greenText : C.text,
+          }}>{isPlayed ? "\u2713 Edit Pitch Log" : "Log Pitches"}</button>
+        )}
         {canEdit && (!isFinalized ? (
           <button onClick={handleFinalize} style={{ padding: "10px 28px", background: C.accent, color: "#fff", border: "none", borderRadius: 6, fontFamily: FONT, fontSize: 14, fontWeight: 600, cursor: "pointer", boxShadow: "0 4px 14px rgba(107,127,94,0.3)" }}>Finalize Lineup</button>
         ) : (
           <button onClick={handleEdit} style={{ ...chipStyle, padding: "10px 28px", borderColor: C.orange, color: C.orange, fontSize: 14, fontWeight: 600 }}>Unlock &amp; Edit</button>
         ))}
       </div>
+
+      {pitchLogModalOpen && (
+        <LogPitchesModal
+          pitcherAssignments={pitcherAssignments}
+          pitchLogsForGame={pitchLogsForGame}
+          roster={fullRoster || roster}
+          gameMeta={gameMeta}
+          onSave={(entries) => { onSavePitchLog(entries); setPitchLogModalOpen(false); }}
+          onCancel={() => setPitchLogModalOpen(false)}
+        />
+      )}
     </div>
+  );
+}
+
+// ══════════════════════════════════════════════════
+// LOG PITCHES MODAL
+// Post-game pitch-count entry. Shows each planned pitcher with their
+// budgeted pitch count as a hint (placeholder), an empty input for the
+// actual count, and a "+ Add another pitcher" dropdown for relief.
+// On Save the parent rebuilds pitchLogs for this game from these entries
+// and flips the schedule entry's `played` flag.
+// ══════════════════════════════════════════════════
+function LogPitchesModal({ pitcherAssignments, pitchLogsForGame, roster, gameMeta, onSave, onCancel }) {
+  const playerById = useMemo(() => {
+    const m = {};
+    roster.forEach(p => { m[p.id] = p; });
+    return m;
+  }, [roster]);
+  const logByPlayer = useMemo(() => {
+    const m = {};
+    pitchLogsForGame.forEach(l => { m[l.playerId] = l; });
+    return m;
+  }, [pitchLogsForGame]);
+
+  // Initial entry list = planned pitchers (with their budget as a hint), plus
+  // any relief pitchers already logged for this game.
+  const initialEntries = useMemo(() => {
+    const seen = new Set();
+    const list = [];
+    pitcherAssignments.forEach(pa => {
+      seen.add(pa.id);
+      const existing = logByPlayer[pa.id];
+      list.push({
+        playerId: pa.id,
+        budget: pa.budget,
+        innings: pa.innings,
+        pitches: existing != null ? String(existing.pitches) : "",
+        planned: true,
+      });
+    });
+    pitchLogsForGame.forEach(l => {
+      if (seen.has(l.playerId)) return;
+      seen.add(l.playerId);
+      list.push({
+        playerId: l.playerId,
+        budget: null,
+        innings: null,
+        pitches: String(l.pitches),
+        planned: false,
+      });
+    });
+    return list;
+  }, [pitcherAssignments, pitchLogsForGame, logByPlayer]);
+
+  const [entries, setEntries] = useState(initialEntries);
+
+  const updatePitches = (playerId, value) => {
+    setEntries(prev => prev.map(e => e.playerId === playerId ? { ...e, pitches: value } : e));
+  };
+  const removeEntry = (playerId) => {
+    setEntries(prev => prev.filter(e => e.playerId !== playerId));
+  };
+  const addPitcher = (playerId) => {
+    if (!playerId) return;
+    if (entries.some(e => e.playerId === playerId)) return;
+    setEntries(prev => [...prev, { playerId, budget: null, innings: null, pitches: "", planned: false }]);
+  };
+
+  // Roster pitchers not already in the entries list.
+  const availableToAdd = useMemo(() => {
+    const taken = new Set(entries.map(e => e.playerId));
+    return roster.filter(p => p.positionMap?.P && !taken.has(p.id));
+  }, [roster, entries]);
+
+  const dateLabel = (() => {
+    if (!gameMeta?.date) return "";
+    try {
+      const d = new Date(gameMeta.date + "T12:00:00");
+      return d.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
+    } catch { return gameMeta.date; }
+  })();
+  const oppLabel = gameMeta?.opponent
+    ? ((gameMeta.homeAway === "away" ? "@ " : "vs ") + gameMeta.opponent)
+    : "";
+
+  return (
+    <div onClick={onCancel} style={{
+      position: "fixed", inset: 0, background: "rgba(40,35,30,0.45)",
+      display: "flex", alignItems: "center", justifyContent: "center",
+      zIndex: 100, padding: 20,
+    }}>
+      <div onClick={(e) => e.stopPropagation()} style={{
+        background: C.surface, borderRadius: 12, padding: 24, maxWidth: 460, width: "100%",
+        fontFamily: FONT, color: C.text, boxShadow: "0 10px 40px rgba(0,0,0,0.15)",
+        maxHeight: "90vh", overflowY: "auto",
+      }}>
+        <h2 style={{ fontFamily: DISPLAY, fontSize: 18, fontWeight: 700, marginBottom: 4 }}>Log pitch counts</h2>
+        <div style={{ fontSize: 13, color: C.textMuted, marginBottom: 18 }}>
+          {[oppLabel, dateLabel].filter(Boolean).join(" · ") || "This game"}
+        </div>
+
+        <div style={{ fontSize: 11, fontWeight: 600, color: C.textMuted, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 }}>
+          Pitchers
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 14 }}>
+          {entries.length === 0 && (
+            <div style={{ fontSize: 13, color: C.textMuted, fontStyle: "italic", padding: "6px 0" }}>
+              No pitchers yet. Add one below to log a count.
+            </div>
+          )}
+          {entries.map(e => {
+            const player = playerById[e.playerId];
+            return (
+              <div key={e.playerId} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 14, fontWeight: 600, color: C.text }}>{player?.name || "(unknown)"}</div>
+                  <div style={{ fontSize: 11, color: C.textMuted }}>
+                    {e.planned
+                      ? `${e.innings || "?"} inning${e.innings === 1 ? "" : "s"} planned · budget ${e.budget}`
+                      : "Relief / unplanned"}
+                  </div>
+                </div>
+                <input type="number" min="0" max="200" value={e.pitches}
+                  onChange={(ev) => updatePitches(e.playerId, ev.target.value)}
+                  placeholder={e.budget != null ? String(e.budget) : "0"}
+                  style={{ width: 70, padding: "6px 8px", border: `1px solid ${C.border}`, borderRadius: 6, fontFamily: FONT, fontSize: 14, color: C.text, background: C.surfaceAlt, textAlign: "center" }} />
+                <span style={{ fontSize: 11, color: C.textMuted, width: 36 }}>pitches</span>
+                {!e.planned && (
+                  <button onClick={() => removeEntry(e.playerId)} title="Remove relief pitcher" style={{
+                    background: "transparent", border: "none", color: C.textMuted,
+                    fontSize: 16, cursor: "pointer", padding: "0 4px", lineHeight: 1,
+                  }}>×</button>
+                )}
+              </div>
+            );
+          })}
+        </div>
+
+        {availableToAdd.length > 0 && (
+          <div style={{ marginBottom: 20 }}>
+            <select value="" onChange={(e) => { addPitcher(e.target.value); e.target.value = ""; }}
+              style={{ width: "100%", padding: "8px 10px", border: `1px dashed ${C.border}`, borderRadius: 6, fontFamily: FONT, fontSize: 13, color: C.textMuted, background: C.surfaceAlt, cursor: "pointer" }}>
+              <option value="">+ Add a relief pitcher…</option>
+              {availableToAdd.map(p => (
+                <option key={p.id} value={p.id}>{p.name}</option>
+              ))}
+            </select>
+          </div>
+        )}
+
+        <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
+          <button onClick={onCancel} style={{ background: C.surface, border: `1px solid ${C.border}`, color: C.text, padding: "8px 14px", borderRadius: 6, fontFamily: FONT, fontSize: 13, fontWeight: 500, cursor: "pointer" }}>Cancel</button>
+          <button onClick={() => onSave(entries)} style={{
+            background: C.accent, border: `1px solid ${C.accent}`, color: "#fff",
+            padding: "8px 14px", borderRadius: 6, fontFamily: FONT, fontSize: 13, fontWeight: 600,
+            cursor: "pointer",
+          }}>Save</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════
+// BENCH SCORE BADGE
+// Golf-scorecard-style indicator for a player's bench count.
+// Par = 2 sits. Under par = circle (green); over par = square (orange/red).
+// Eagle (0) and double bogey (4+) get a doubled outline via box-shadow ring.
+// Par renders nothing so cells stay clean for the typical case.
+// `size="sm"` (default) is a 14px corner badge, absolutely positioned —
+// safe to drop into any cell that already has `position: relative`.
+// `size="md"` is a 22px inline badge for the Player Summary table.
+// ══════════════════════════════════════════════════
+function BenchScoreBadge({ count, size = "sm" }) {
+  if (count == null || count === 2) return null;
+  const px = size === "md" ? 22 : 16;
+  const isUnder = count < 2;
+  const isDouble = count === 0 || count >= 4;
+  const color = (count === 0 || count === 1) ? C.greenText
+              : count === 3 ? C.tierOrange
+              : C.redText;
+  // sm = corner badge in a cell, vertically centred against the right edge.
+  // md = inline shape that wraps a count number in the Player Summary column.
+  const positioning = size === "sm"
+    ? { position: "absolute", top: "50%", right: 4, transform: "translateY(-50%)", pointerEvents: "none" }
+    : { verticalAlign: "middle" };
+  return (
+    <span style={{
+      ...positioning,
+      display: "inline-flex",
+      alignItems: "center",
+      justifyContent: "center",
+      width: px, height: px,
+      border: `1.5px solid ${color}`,
+      borderRadius: isUnder ? "50%" : 2,
+      boxSizing: "border-box",
+      boxShadow: isDouble ? `0 0 0 1.5px ${C.surface}, 0 0 0 3px ${color}` : "none",
+      background: "transparent",
+      fontSize: size === "md" ? 12 : 0,
+      fontWeight: 700,
+      color: color,
+      lineHeight: 1,
+    }}>
+      {size === "md" ? count : null}
+    </span>
   );
 }
 
@@ -3420,6 +3927,8 @@ function ScheduleTab({ schedule, setSchedule, roster, onOpenGame, canEdit = true
   const [editorEntryId, setEditorEntryId] = useState(null);
   const [editorOpponent, setEditorOpponent] = useState("");
   const [editorHomeAway, setEditorHomeAway] = useState("home");
+  // Optional 24h "HH:MM" string. Empty = unspecified; sorts last within a day.
+  const [editorTime, setEditorTime] = useState("");
 
   const openAdd = (date) => {
     setEditorMode("add");
@@ -3428,6 +3937,7 @@ function ScheduleTab({ schedule, setSchedule, roster, onOpenGame, canEdit = true
     setEditorEntryId(null);
     setEditorOpponent("");
     setEditorHomeAway("home");
+    setEditorTime("");
     setEditorOpen(true);
   };
   const openEdit = (entry) => {
@@ -3437,13 +3947,15 @@ function ScheduleTab({ schedule, setSchedule, roster, onOpenGame, canEdit = true
     setEditorEntryId(entry.id);
     setEditorOpponent(entry.opponent || "");
     setEditorHomeAway(entry.homeAway || "home");
+    setEditorTime(entry.time || "");
     setEditorOpen(true);
   };
   const saveEditor = () => {
     const opp = editorOpponent.trim();
     if (!opp) return;
+    const time = editorTime.trim() || null;
     if (editorMode === "edit" && editorEntryId) {
-      setSchedule(prev => prev.map(e => e.id === editorEntryId ? { ...e, opponent: opp, homeAway: editorHomeAway } : e));
+      setSchedule(prev => prev.map(e => e.id === editorEntryId ? { ...e, opponent: opp, homeAway: editorHomeAway, time } : e));
     } else {
       setSchedule(prev => [...prev, {
         id: "sch_" + Date.now() + "_" + Math.floor(Math.random() * 1000),
@@ -3451,21 +3963,24 @@ function ScheduleTab({ schedule, setSchedule, roster, onOpenGame, canEdit = true
         kind: "game",
         opponent: opp,
         homeAway: editorHomeAway,
+        time,
       }]);
     }
     setEditorOpen(false);
   };
   const setAsPractice = () => {
+    const time = editorTime.trim() || null;
     if (editorMode === "edit" && editorEntryId) {
       // Convert an existing game entry to a practice (drops opponent + lineup).
       setSchedule(prev => prev.map(e => e.id === editorEntryId ? {
-        id: e.id, date: e.date, kind: "practice",
+        id: e.id, date: e.date, kind: "practice", time,
       } : e));
     } else {
       setSchedule(prev => [...prev, {
         id: "sch_" + Date.now() + "_" + Math.floor(Math.random() * 1000),
         date: editorDate,
         kind: "practice",
+        time,
       }]);
     }
     setEditorOpen(false);
@@ -3480,9 +3995,23 @@ function ScheduleTab({ schedule, setSchedule, roster, onOpenGame, canEdit = true
     setEditorOpen(false);
   };
 
+  // Each date can hold multiple entries (tournament weekends, game + practice
+  // on the same day, etc.). Sorted by time ascending within a day; entries
+  // without a time sort last so timed games appear in chronological order.
   const byDate = useMemo(() => {
     const m = {};
-    schedule.forEach(e => { m[e.date] = e; });
+    schedule.forEach(e => {
+      if (!m[e.date]) m[e.date] = [];
+      m[e.date].push(e);
+    });
+    for (const date of Object.keys(m)) {
+      m[date].sort((a, b) => {
+        if (!a.time && !b.time) return 0;
+        if (!a.time) return 1;
+        if (!b.time) return -1;
+        return a.time.localeCompare(b.time);
+      });
+    }
     return m;
   }, [schedule]);
 
@@ -3531,11 +4060,75 @@ function ScheduleTab({ schedule, setSchedule, roster, onOpenGame, canEdit = true
           mode={editorMode} kind={editorKind} date={editorDate}
           opponent={editorOpponent} setOpponent={setEditorOpponent}
           homeAway={editorHomeAway} setHomeAway={setEditorHomeAway}
+          time={editorTime} setTime={setEditorTime}
           onSave={saveEditor} onDelete={deleteEditor}
           onSetAsPractice={setAsPractice}
           onCancel={() => setEditorOpen(false)}
         />
       )}
+    </div>
+  );
+}
+
+// Format a 24h "HH:MM" time string as "9am" / "1:30pm". Returns "" for empty.
+function formatTime(t) {
+  if (!t) return "";
+  const parts = String(t).split(":");
+  const h = parseInt(parts[0], 10);
+  const m = parts[1] ? parseInt(parts[1], 10) : 0;
+  if (Number.isNaN(h)) return String(t);
+  const ampm = h >= 12 ? "pm" : "am";
+  const h12 = h % 12 || 12;
+  return m === 0 ? `${h12}${ampm}` : `${h12}:${String(m).padStart(2, "0")}${ampm}`;
+}
+
+// One game/practice card inside a calendar day cell. Compact so multiple
+// stack cleanly; click body opens the entry, "edit" pill opens the editor.
+function EntryCard({ entry, pitcherNames, onOpen, onEdit, canEdit }) {
+  const isPractice = entry.kind === "practice";
+  const timeStr = entry.time ? formatTime(entry.time) : "";
+
+  if (isPractice) {
+    return (
+      <div onClick={canEdit ? () => onEdit(entry) : undefined} style={{
+        background: C.orangeLight, border: `1px solid ${C.orange}`, borderRadius: 6,
+        padding: "4px 6px", cursor: canEdit ? "pointer" : "default",
+      }}>
+        <div style={{ fontSize: 11, fontWeight: 600, color: C.orange, lineHeight: 1.3 }}>
+          {timeStr && <span style={{ color: C.textMuted, fontWeight: 500, marginRight: 4 }}>{timeStr}</span>}
+          Practice
+        </div>
+      </div>
+    );
+  }
+
+  const pitchers = pitcherNames(entry);
+  const hasLineup = !!pitchers;
+  const isPlayed = !!entry.played;
+  const oppLabel = (entry.homeAway === "away" ? "@ " : "vs ") + (entry.opponent || "?");
+  return (
+    <div onClick={() => onOpen(entry)} style={{
+      background: hasLineup ? C.greenLight : C.blueLight,
+      border: `1px solid ${hasLineup ? C.green : C.blue}`,
+      borderRadius: 6, padding: "4px 6px", cursor: "pointer",
+      opacity: isPlayed ? 0.85 : 1,
+    }}>
+      {/* Top row: time on the left, edit pill on the right. Always rendered
+          so spacing stays consistent whether or not a time is set. */}
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", minHeight: 14 }}>
+        <span style={{ fontSize: 10, color: C.textMuted, fontWeight: 500, display: "inline-flex", alignItems: "center", gap: 3 }}>{isPlayed && <span title="Pitch counts logged" style={{ color: C.greenText, fontWeight: 700 }}>{"✓"}</span>}{timeStr || " "}</span>
+        {canEdit && <button onClick={(e) => { e.stopPropagation(); onEdit(entry); }} style={{
+          background: C.surface, border: `1px solid ${C.border}`,
+          padding: "0 5px", cursor: "pointer", color: C.text,
+          fontSize: 9, lineHeight: 1.4, borderRadius: 3, flexShrink: 0,
+        }} title="Edit">edit</button>}
+      </div>
+      {/* Opponent label gets its own full-width row so long names don't wrap
+          letter-by-letter against a narrow flex column. */}
+      <div style={{ fontSize: 11, fontWeight: 700, color: C.text, lineHeight: 1.2, marginTop: 2, wordBreak: "break-word" }}>{oppLabel}</div>
+      <div style={{ fontSize: 10, color: hasLineup ? C.greenText : C.textMuted, lineHeight: 1.2, fontStyle: hasLineup ? "normal" : "italic", marginTop: 2, wordBreak: "break-word" }}>
+        {hasLineup ? pitchers.join(", ") : "no lineup"}
+      </div>
     </div>
   );
 }
@@ -3564,11 +4157,9 @@ function MonthGrid({ year, monthIdx, label, dayHeaders, byDate, pitcherNames, on
       <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 6 }}>
         {cells.map(c => {
           if (c.kind === "blank") return <div key={c.key} style={{ minHeight: 110 }} />;
-          const entry = byDate[c.date];
-          if (!entry) {
+          const entries = byDate[c.date] || [];
+          if (entries.length === 0) {
             if (!canEdit) {
-              // Read-only: empty days are inert. Same dimensions so the grid
-              // doesn't reflow between coach and parent views.
               return (
                 <div key={c.key} style={{
                   minHeight: 110, padding: "8px 10px",
@@ -3594,43 +4185,33 @@ function MonthGrid({ year, monthIdx, label, dayHeaders, byDate, pitcherNames, on
               </button>
             );
           }
-          if (entry.kind === "practice") {
-            return (
-              <div key={c.key} onClick={canEdit ? () => onEdit(entry) : undefined} style={{
-                minHeight: 110, padding: "8px 10px",
-                background: C.orangeLight,
-                border: `1px solid ${C.orange}`,
-                borderRadius: 8, cursor: canEdit ? "pointer" : "default",
-                display: "flex", flexDirection: "column", gap: 4,
-              }}>
-                <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{c.day}</div>
-                <div style={{ fontSize: 13, fontWeight: 600, color: C.orange, lineHeight: 1.3, marginTop: 2 }}>Practice</div>
-              </div>
-            );
-          }
-          const pitchers = pitcherNames(entry);
-          const hasLineup = !!pitchers;
-          const oppLabel = (entry.homeAway === "away" ? "@ " : "vs ") + (entry.opponent || "?");
+          // Day with one or more entries: day number + "+" sit in the header
+          // row (using the otherwise-empty space next to the date), then the
+          // stacked cards below. Click the "+" to add another game/practice
+          // on the same day (e.g. tournament weekends).
           return (
-            <div key={c.key} onClick={() => onOpen(entry)} style={{
-              minHeight: 110, padding: "8px 10px",
-              background: hasLineup ? C.greenLight : C.blueLight,
-              border: `1px solid ${hasLineup ? C.green : C.blue}`,
-              borderRadius: 8, position: "relative", cursor: "pointer",
-              display: "flex", flexDirection: "column", gap: 4,
+            <div key={c.key} style={{
+              minHeight: 110, padding: "6px 7px",
+              background: C.surface, border: `1px solid ${C.border}`,
+              borderRadius: 8, display: "flex", flexDirection: "column", gap: 4,
             }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                 <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{c.day}</div>
-                {canEdit && <button onClick={(e) => { e.stopPropagation(); onEdit(entry); }} style={{
-                  background: "rgba(255,255,255,0.6)", border: `1px solid ${C.border}`,
-                  padding: "1px 6px", cursor: "pointer", color: C.textMuted,
-                  fontSize: 11, lineHeight: 1.2, borderRadius: 4,
-                }} title="Edit game">edit</button>}
+                {canEdit && (
+                  <button onClick={() => onAdd(c.date)} title="Add another game or practice on this day"
+                    style={{
+                      background: "transparent", border: `1px solid ${C.border}`,
+                      color: C.textMuted, fontSize: 14, lineHeight: 1, fontWeight: 600,
+                      width: 20, height: 20, borderRadius: 4, cursor: "pointer",
+                      display: "inline-flex", alignItems: "center", justifyContent: "center",
+                      padding: 0, fontFamily: FONT,
+                    }}>+</button>
+                )}
               </div>
-              <div style={{ fontSize: 13, fontWeight: 600, color: C.text, lineHeight: 1.3, wordBreak: "break-word" }}>{oppLabel}</div>
-              <div style={{ fontSize: 11, color: hasLineup ? C.greenText : C.textMuted, lineHeight: 1.3, fontStyle: hasLineup ? "normal" : "italic", wordBreak: "break-word" }}>
-                {hasLineup ? pitchers.join(", ") : "no lineup"}
-              </div>
+              {entries.map(entry => (
+                <EntryCard key={entry.id} entry={entry} pitcherNames={pitcherNames}
+                  onOpen={onOpen} onEdit={onEdit} canEdit={canEdit} />
+              ))}
             </div>
           );
         })}
@@ -3639,7 +4220,7 @@ function MonthGrid({ year, monthIdx, label, dayHeaders, byDate, pitcherNames, on
   );
 }
 
-function ScheduleEditorModal({ mode, kind, date, opponent, setOpponent, homeAway, setHomeAway, onSave, onDelete, onSetAsPractice, onCancel }) {
+function ScheduleEditorModal({ mode, kind, date, opponent, setOpponent, homeAway, setHomeAway, time, setTime, onSave, onDelete, onSetAsPractice, onCancel }) {
   const dateLabel = (() => {
     try {
       const d = new Date(date + "T12:00:00");
@@ -3663,6 +4244,10 @@ function ScheduleEditorModal({ mode, kind, date, opponent, setOpponent, homeAway
           {isPracticeEdit ? "Practice" : (mode === "edit" ? "Edit game" : "Add game")}
         </h2>
         <div style={{ fontSize: 13, color: C.textMuted, marginBottom: 18 }}>{dateLabel}</div>
+
+        <label style={{ fontSize: 11, fontWeight: 600, color: C.textMuted, textTransform: "uppercase", letterSpacing: 0.5, display: "block", marginBottom: 6 }}>Time (optional)</label>
+        <input type="time" value={time || ""} onChange={e => setTime(e.target.value)}
+          style={{ width: "100%", padding: "8px 10px", border: `1px solid ${C.border}`, borderRadius: 6, fontFamily: FONT, fontSize: 14, color: C.text, background: C.surfaceAlt, marginBottom: 16 }} />
 
         {isPracticeEdit ? (
           <div style={{
@@ -3697,8 +4282,14 @@ function ScheduleEditorModal({ mode, kind, date, opponent, setOpponent, homeAway
             <button onClick={onDelete} style={{ background: "transparent", border: `1px solid ${C.red}`, color: C.redText, padding: "8px 12px", borderRadius: 6, fontFamily: FONT, fontSize: 13, fontWeight: 500, cursor: "pointer" }}>Delete</button>
           )}
           <div style={{ display: "flex", gap: 8 }}>
-            <button onClick={onCancel} style={{ background: C.surface, border: `1px solid ${C.border}`, color: C.text, padding: "8px 14px", borderRadius: 6, fontFamily: FONT, fontSize: 13, fontWeight: 500, cursor: "pointer" }}>{isPracticeEdit ? "Close" : "Cancel"}</button>
-            {!isPracticeEdit && (
+            <button onClick={onCancel} style={{ background: C.surface, border: `1px solid ${C.border}`, color: C.text, padding: "8px 14px", borderRadius: 6, fontFamily: FONT, fontSize: 13, fontWeight: 500, cursor: "pointer" }}>Cancel</button>
+            {isPracticeEdit ? (
+              <button onClick={onSetAsPractice} style={{
+                background: C.accent, border: `1px solid ${C.accent}`, color: "#fff",
+                padding: "8px 14px", borderRadius: 6, fontFamily: FONT, fontSize: 13, fontWeight: 600,
+                cursor: "pointer",
+              }}>Save</button>
+            ) : (
               <button onClick={onSave} disabled={!oppValid} style={{
                 background: oppValid ? C.accent : C.borderLight,
                 border: `1px solid ${oppValid ? C.accent : C.border}`,
