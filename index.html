@@ -110,6 +110,11 @@ const C_DARK = {
   tierGreen: "#8fb37e", tierYellow: "#d4a82c", tierOrange: "#cc5a28",
 };
 const C = { ...C_LIGHT };
+// Tier color/background lookups. Mutated in applyTheme so dark mode swaps
+// the muted-on-dark tints rather than showing the light tints against a dark
+// surface (which would be unreadable).
+const TIER_BG_LIGHT = { preferred: "#eaf2e6", secondary: "#faf0cc", emergency: "#fbe0d0" };
+const TIER_BG_DARK  = { preferred: "#2d3a26", secondary: "#3d3520", emergency: "#3a2825" };
 function applyTheme(name) {
   const src = name === "dark" ? C_DARK : C_LIGHT;
   for (const k of Object.keys(src)) C[k] = src[k];
@@ -124,9 +129,25 @@ function applyTheme(name) {
     Object.assign(tdStyle,       { borderBottom: `1px solid ${C.borderLight}` });
     Object.assign(inputStyle,    { background: C.surfaceAlt, border: `1px solid ${C.border}`, color: C.text });
   }
+  if (typeof TIER_COLORS !== "undefined") {
+    TIER_COLORS.preferred = C.tierGreen;
+    TIER_COLORS.secondary = C.tierYellow;
+    TIER_COLORS.emergency = C.tierOrange;
+    const bg = name === "dark" ? TIER_BG_DARK : TIER_BG_LIGHT;
+    TIER_BG.preferred = bg.preferred;
+    TIER_BG.secondary = bg.secondary;
+    TIER_BG.emergency = bg.emergency;
+  }
 }
 const FONT = "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
 const DISPLAY = "'Georgia', 'Times New Roman', serif";
+
+const GAME_TYPES = [
+  { id: "exhibition", label: "Exhibition" },
+  { id: "season", label: "Season" },
+  { id: "tournament", label: "Tournament" },
+  { id: "playoffs", label: "Playoffs" },
+];
 
 const ALL_POS = ["P","C","1B","2B","3B","SS","LF","CF","RF"];
 const FIELD_POS = ["C","1B","2B","3B","SS","LF","CF","RF"];
@@ -2248,10 +2269,9 @@ function App() {
 
   const tabs = [
     { id:"schedule", label:"Schedule" },
-    { id:"roster",   label:"Roster" },
-    { id:"armcare",  label:"Arm Care" },
-    { id:"setup",    label:"Game Settings" },
-    { id:"lineup",   label:"Lineup" },
+    { id:"setup",    label:"Create a Lineup" },
+    { id:"lineup",   label:"Lineup Editor" },
+    { id:"roster",   label:"Team Reports" },
   ];
 
   if (!authChecked) {
@@ -2317,8 +2337,7 @@ function App() {
           </div>
         )}
         {tab === "schedule" && <ScheduleTab schedule={schedule} setSchedule={setSchedule} roster={sortedRoster} onOpenGame={handleOpenScheduleEntry} />}
-        {tab === "armcare" && <ArmCareTab roster={sortedRoster} pitchLogs={pitchLogs} setPitchLogs={setPitchLogs} />}
-        {tab === "roster" && <RosterTab roster={sortedRoster} setRoster={setRoster} />}
+        {tab === "roster" && <RosterTab roster={sortedRoster} setRoster={setRoster} schedule={schedule} pitchLogs={pitchLogs} setPitchLogs={setPitchLogs} />}
         {tab === "setup" && <SetupTab roster={sortedRoster} availablePlayers={availablePlayers} absentIds={absentIds} setAbsentIds={setAbsentIds}
           pitcherAssignments={pitcherAssignments} setPitcherAssignments={setPitcherAssignments}
           catcherAssignments={catcherAssignments} setCatcherAssignments={setCatcherAssignments}
@@ -2352,7 +2371,7 @@ function App() {
 // ══════════════════════════════════════════════════
 // ROSTER TAB
 // ══════════════════════════════════════════════════
-function RosterTab({ roster, setRoster }) {
+function RosterTab({ roster, setRoster, schedule = [], pitchLogs = [], setPitchLogs = () => {} }) {
   const [showAdd, setShowAdd] = useState(false);
   const [name, setName] = useState("");
   const [number, setNumber] = useState("");
@@ -2361,6 +2380,99 @@ function RosterTab({ roster, setRoster }) {
   const [editName, setEditName] = useState("");
   const [editNumber, setEditNumber] = useState("");
   const [confirmDelete, setConfirmDelete] = useState(null);
+  // Date range for the Usage Report. Empty = whole season (no bound on that
+  // side). Both bounds are inclusive ISO date strings (YYYY-MM-DD).
+  const [usageStart, setUsageStart] = useState("");
+  const [usageEnd,   setUsageEnd]   = useState("");
+
+  // Past games (strictly before wall-clock today) that have a saved lineup
+  // AND fall within the chosen date range. Empty range bounds = no limit on
+  // that side. Re-used by both the inning-count math and the "N games" label.
+  const includedGames = useMemo(() => {
+    const today = new Date().toISOString().slice(0, 10);
+    return schedule.filter(g => {
+      if (!g || !g.lineup || !Array.isArray(g.lineup.grid)) return false;
+      if (!g.date || g.date >= today) return false;
+      if (usageStart && g.date < usageStart) return false;
+      if (usageEnd && g.date > usageEnd) return false;
+      return true;
+    });
+  }, [schedule, usageStart, usageEnd]);
+
+  // Inning counts per (player, position).
+  const usageByPlayer = useMemo(() => {
+    const result = {};
+    roster.forEach(p => { result[p.id] = {}; });
+    includedGames.forEach(g => {
+      g.lineup.grid.forEach(inn => {
+        ALL_POS.forEach(pos => {
+          const pid = inn[pos];
+          if (pid && result[pid]) result[pid][pos] = (result[pid][pos] || 0) + 1;
+        });
+      });
+    });
+    return result;
+  }, [roster, includedGames]);
+
+  // Usage range for the heatmap colors below. Computed across all (player,
+  // position) cells with a non-zero count.
+  const usageRange = useMemo(() => {
+    let min = Infinity, max = 0;
+    Object.values(usageByPlayer).forEach(byPos => {
+      Object.values(byPos).forEach(n => {
+        if (n > 0) { if (n < min) min = n; if (n > max) max = n; }
+      });
+    });
+    return { min: min === Infinity ? 0 : min, max };
+  }, [usageByPlayer]);
+
+  // Conditional-format gradient for the Usage Report cells:
+  //   lowest non-zero count → cool light blue
+  //   middle of the range   → neutral warm grey
+  //   highest count         → bright orange
+  // Both palettes have a dark-mode counterpart so the heatmap stays legible
+  // on the dark background (C.bg comparison flips the stops).
+  const heatColor = (count, min, max) => {
+    const t = max === min ? 0.5 : (count - min) / (max - min);
+    const dark = C.bg === C_DARK.bg;
+    const stops = dark
+      ? [[42, 54, 64], [50, 48, 42], [154, 70, 36]]
+      : [[200, 220, 230], [224, 218, 210], [228, 122, 58]];
+    let c;
+    if (t < 0.5) {
+      const u = t * 2;
+      c = stops[0].map((v, i) => Math.round(v + (stops[1][i] - v) * u));
+    } else {
+      const u = (t - 0.5) * 2;
+      c = stops[1].map((v, i) => Math.round(v + (stops[2][i] - v) * u));
+    }
+    return `rgb(${c[0]},${c[1]},${c[2]})`;
+  };
+
+  // Depth chart grouped by tier × field position. Excludes P and BN per spec.
+  const depthChart = useMemo(() => {
+    const byTier = { preferred: {}, secondary: {}, emergency: {} };
+    POS_TIERS.forEach(t => { FIELD_POS.forEach(pos => byTier[t][pos] = []); });
+    roster.forEach(p => {
+      FIELD_POS.forEach(pos => {
+        const tier = playerTier(p, pos);
+        if (tier) byTier[tier][pos].push(p);
+      });
+    });
+    POS_TIERS.forEach(t => {
+      FIELD_POS.forEach(pos => {
+        byTier[t][pos].sort((a, b) => playerRank(a, pos) - playerRank(b, pos));
+      });
+    });
+    return byTier;
+  }, [roster]);
+
+  const sectionHeader = (title, subtitle) => (
+    <div style={{ marginBottom: 12 }}>
+      <h2 style={{ fontFamily: DISPLAY, fontSize: 18, fontWeight: 700, color: C.text, margin: 0 }}>{title}</h2>
+      {subtitle && <div style={{ fontSize: 12, color: C.textMuted, marginTop: 4 }}>{subtitle}</div>}
+    </div>
+  );
 
   const cycleTier = (pos, map, setter) => {
     const cur = map[pos] || null;
@@ -2393,6 +2505,109 @@ function RosterTab({ roster, setRoster }) {
 
   return (
     <div>
+      {/* Usage Report — innings played per (player, position) from past
+          games. Tighter padding than the editable Roster table since it's
+          read-only and we want the whole grid on screen at once. */}
+      <div style={{ marginBottom: 28 }}>
+        {sectionHeader("Usage Report", "Innings each player has spent at each position across completed (past) games.")}
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10, flexWrap: "wrap" }}>
+          <span style={{ fontSize: 12, color: C.textMuted, fontWeight: 500 }}>Range:</span>
+          <input type="date" value={usageStart} onChange={e => setUsageStart(e.target.value)}
+            style={{ background: C.surfaceAlt, border: `1px solid ${C.border}`, color: C.text, padding: "3px 8px", borderRadius: 6, fontFamily: FONT, fontSize: 12, outline: "none" }} />
+          <span style={{ fontSize: 12, color: C.textMuted }}>to</span>
+          <input type="date" value={usageEnd} onChange={e => setUsageEnd(e.target.value)}
+            style={{ background: C.surfaceAlt, border: `1px solid ${C.border}`, color: C.text, padding: "3px 8px", borderRadius: 6, fontFamily: FONT, fontSize: 12, outline: "none" }} />
+          {(usageStart || usageEnd) && (
+            <button onClick={() => { setUsageStart(""); setUsageEnd(""); }}
+              style={{ ...miniChipStyle, fontSize: 11, padding: "3px 10px" }}>Whole season</button>
+          )}
+          <span style={{ fontSize: 11, color: C.textMuted, marginLeft: "auto" }}>
+            {includedGames.length} {includedGames.length === 1 ? "game" : "games"} included
+          </span>
+        </div>
+        <div style={{ overflowX: "auto", borderRadius: 8, boxShadow: "0 1px 4px rgba(0,0,0,0.06)" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse", background: C.surface, borderRadius: 8 }}>
+            <thead><tr>
+              <th style={{ ...thStyle, width: 36, textAlign: "center", padding: "6px 4px" }}>#</th>
+              <th style={{ ...thStyle, textAlign: "left", minWidth: 88, paddingLeft: 10, padding: "6px 4px 6px 10px" }}>Player</th>
+              {ALL_POS.map(pos => <th key={pos} style={{ ...thStyle, width: 36, padding: "6px 2px" }}>{pos}</th>)}
+            </tr></thead>
+            <tbody>
+              {roster.map((p, i) => {
+                const bg = i % 2 === 0 ? C.surface : C.surfaceAlt;
+                const usage = usageByPlayer[p.id] || {};
+                return (
+                  <tr key={p.id}>
+                    <td style={{ ...tdStyle, background: bg, textAlign: "center", color: C.accent, fontWeight: 600, padding: "3px 2px", fontSize: 12 }}>{p.number || "—"}</td>
+                    <td style={{ ...tdStyle, background: bg, fontWeight: 600, padding: "3px 2px 3px 10px", fontSize: 13 }}>{p.name}</td>
+                    {ALL_POS.map(pos => {
+                      const count = usage[pos] || 0;
+                      const heat = count > 0 ? heatColor(count, usageRange.min, usageRange.max) : null;
+                      return (
+                        <td key={pos} style={{
+                          ...tdStyle, textAlign: "center", padding: "3px 2px",
+                          background: heat || bg,
+                          color: count > 0 ? C.text : C.textLight,
+                          fontWeight: count > 0 ? 700 : 400,
+                          fontSize: 12,
+                        }}>{count > 0 ? count : "—"}</td>
+                      );
+                    })}
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* Arm Care — embedded here so all read-mostly team data lives on a
+          single page. Uses the standalone ArmCareTab component as-is. */}
+      <div style={{ marginBottom: 32 }}>
+        {sectionHeader("Arm Care", "Pitcher rest tracker, status, and pitch log history.")}
+        <ArmCareTab roster={roster} pitchLogs={pitchLogs} setPitchLogs={setPitchLogs} />
+      </div>
+
+      {/* Depth Chart — one column per field position (no P, no BN). Players
+          stack vertically as tier-colored chips: green = preferred,
+          yellow = secondary, orange = emergency. Within a tier, sorted by rank. */}
+      <div style={{ marginBottom: 32 }}>
+        {sectionHeader("Depth Chart", "Players at each field position, stacked by tier (green = preferred, yellow = secondary, orange = emergency).")}
+        <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 8, padding: 10, overflowX: "auto" }}>
+          <div style={{ display: "grid", gridTemplateColumns: `repeat(${FIELD_POS.length}, minmax(70px, 1fr))`, gap: 6 }}>
+            {FIELD_POS.map(pos => {
+              const players = [
+                ...(depthChart.preferred[pos] || []).map(p => ({ p, tier: "preferred" })),
+                ...(depthChart.secondary[pos] || []).map(p => ({ p, tier: "secondary" })),
+                ...(depthChart.emergency[pos] || []).map(p => ({ p, tier: "emergency" })),
+              ];
+              return (
+                <div key={pos} style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                  <div style={{ ...thStyle, padding: "6px 4px", textAlign: "center", borderBottom: "none", borderRadius: 4 }}>{pos}</div>
+                  {players.length === 0 && (
+                    <div style={{ color: C.textLight, fontSize: 12, textAlign: "center", padding: "8px 0", fontStyle: "italic" }}>—</div>
+                  )}
+                  {players.map(({ p, tier }) => (
+                    <div key={`${pos}-${p.id}-${tier}`} style={{
+                      background: TIER_BG[tier],
+                      color: TIER_COLORS[tier],
+                      border: `1px solid ${TIER_COLORS[tier]}`,
+                      padding: "5px 6px",
+                      borderRadius: 4,
+                      fontSize: 12,
+                      fontWeight: 600,
+                      textAlign: "center",
+                    }}>{p.name}</div>
+                  ))}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+
+      {/* Positional Priority (editable position-tier matrix) */}
+      {sectionHeader("Positional Priority", "Tap any cell to cycle a player's tier at that position. Add, edit, or remove players.")}
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
         <div style={{ fontSize: 12, color: C.textMuted, fontWeight: 500 }}>{roster.length} players</div>
         <div style={{ display: "flex", gap: 8 }}>
@@ -2671,12 +2886,6 @@ function ArmCareTab({ roster, pitchLogs, setPitchLogs, canEdit = true }) {
 // SETUP TAB (no CF restriction)
 // ══════════════════════════════════════════════════
 function SetupTab({ roster, availablePlayers, absentIds, setAbsentIds, pitcherAssignments, setPitcherAssignments, catcherAssignments, setCatcherAssignments, benchTiers, setBenchTiers, pitcherAvailability, gameInnings, setGameInnings, gameMeta, setGameMeta, onGenerate }) {
-  const GAME_TYPES = [
-    { id: "exhibition", label: "Exhibition" },
-    { id: "season", label: "Season" },
-    { id: "tournament", label: "Tournament" },
-    { id: "playoffs", label: "Playoffs" },
-  ];
   const updateMeta = (field, value) => setGameMeta(prev => ({ ...prev, [field]: value }));
   const toggleAbsent = (id) => {
     setAbsentIds(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
@@ -2796,28 +3005,53 @@ function SetupTab({ roster, availablePlayers, absentIds, setAbsentIds, pitcherAs
             </div>
           );
         })}
-        <div style={{ marginTop: 14 }}>
-          <div style={{ fontSize: 12, color: C.textMuted, marginBottom: 8, fontWeight: 500 }}>Available arms:</div>
-          <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-            {pitchEligible.filter(p => !pitcherAssignments.some(pa => pa.id === p.id)).map(p => {
-              const avail = pitcherAvailability[p.id];
-              const isAvail = avail?.available !== false;
-              const hasWarn = isAvail && avail?.hasWarnings;
-              const tip = avail?.warnings?.length > 0 ? avail.warnings.map(w => w.msg).join(" · ") : avail?.reason;
-              return <button key={p.id} onClick={() => isAvail && addPitcher(p.id)} title={tip || ""} style={{
-                  ...chipStyle, padding: "6px 12px",
-                  opacity: isAvail ? 1 : 0.45,
-                  cursor: isAvail ? "pointer" : "not-allowed",
-                  background:  !isAvail ? C.redLight : hasWarn ? C.orangeLight : C.greenLight,
-                  borderColor: !isAvail ? C.red      : hasWarn ? C.orange      : C.green,
-                  color:       !isAvail ? C.redText  : hasWarn ? C.orange      : C.greenText,
-                }}>
-                {hasWarn && <span style={{ marginRight: 4 }}>{"⚠"}</span>}{p.name}
-                {avail && !isAvail && <span style={{ fontSize: 10, marginLeft: 4 }}>({avail.reason})</span>}
-              </button>;
-            })}
-          </div>
-        </div>
+        {(() => {
+          const unassigned = pitchEligible.filter(p => !pitcherAssignments.some(pa => pa.id === p.id));
+          const available   = unassigned.filter(p => pitcherAvailability[p.id]?.available !== false);
+          const unavailable = unassigned.filter(p => pitcherAvailability[p.id]?.available === false);
+          return (
+            <React.Fragment>
+              <div style={{ marginTop: 14 }}>
+                <div style={{ fontSize: 12, color: C.textMuted, marginBottom: 8, fontWeight: 500 }}>Available arms:</div>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                  {available.length === 0 && (
+                    <span style={{ fontSize: 12, color: C.textLight, fontStyle: "italic" }}>None — all eligible pitchers are already assigned or resting.</span>
+                  )}
+                  {available.map(p => {
+                    const avail = pitcherAvailability[p.id];
+                    const hasWarn = !!avail?.hasWarnings;
+                    const tip = avail?.warnings?.length > 0 ? avail.warnings.map(w => w.msg).join(" · ") : avail?.reason;
+                    return <button key={p.id} onClick={() => addPitcher(p.id)} title={tip || ""} style={{
+                        ...chipStyle, padding: "6px 12px",
+                        background:  hasWarn ? C.orangeLight : C.greenLight,
+                        borderColor: hasWarn ? C.orange      : C.green,
+                        color:       hasWarn ? C.orange      : C.greenText,
+                      }}>
+                      {hasWarn && <span style={{ marginRight: 4 }}>{"⚠"}</span>}{p.name}
+                    </button>;
+                  })}
+                </div>
+              </div>
+              {unavailable.length > 0 && (
+                <div style={{ marginTop: 14 }}>
+                  <div style={{ fontSize: 12, color: C.textMuted, marginBottom: 8, fontWeight: 500 }}>Unavailable:</div>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                    {unavailable.map(p => {
+                      const avail = pitcherAvailability[p.id];
+                      return <button key={p.id} disabled title={avail?.reason || "Unavailable"} style={{
+                          ...chipStyle, padding: "6px 12px",
+                          opacity: 0.5, cursor: "not-allowed",
+                          background: C.redLight, borderColor: C.red, color: C.redText,
+                        }}>
+                        {p.name}
+                      </button>;
+                    })}
+                  </div>
+                </div>
+              )}
+            </React.Fragment>
+          );
+        })()}
       </Section>
 
       <Section title={`Catching Plan (${totalCatcherInnings}/${gameInnings} inn)`} alert={totalCatcherInnings < gameInnings ? `Need ${gameInnings - totalCatcherInnings} more innings` : null} success={totalCatcherInnings >= gameInnings}>
@@ -3908,9 +4142,12 @@ function ScheduleTab({ schedule, setSchedule, roster, onOpenGame, canEdit = true
   const [editorDate, setEditorDate] = useState("");
   const [editorEntryId, setEditorEntryId] = useState(null);
   const [editorOpponent, setEditorOpponent] = useState("");
-  const [editorHomeAway, setEditorHomeAway] = useState("home");
-  // Optional 24h "HH:MM" string. Empty = unspecified; sorts last within a day.
+  // Empty by default — coach must explicitly choose Home or Away to save.
+  const [editorHomeAway, setEditorHomeAway] = useState("");
+  // 24h "HH:MM" string. Required for game entries.
   const [editorTime, setEditorTime] = useState("");
+  // Game type defaults to "season" since regular-season games are most common.
+  const [editorGameType, setEditorGameType] = useState("season");
 
   const openAdd = (date) => {
     setEditorMode("add");
@@ -3918,8 +4155,9 @@ function ScheduleTab({ schedule, setSchedule, roster, onOpenGame, canEdit = true
     setEditorDate(date);
     setEditorEntryId(null);
     setEditorOpponent("");
-    setEditorHomeAway("home");
+    setEditorHomeAway("");
     setEditorTime("");
+    setEditorGameType("season");
     setEditorOpen(true);
   };
   const openEdit = (entry) => {
@@ -3928,27 +4166,53 @@ function ScheduleTab({ schedule, setSchedule, roster, onOpenGame, canEdit = true
     setEditorDate(entry.date);
     setEditorEntryId(entry.id);
     setEditorOpponent(entry.opponent || "");
-    setEditorHomeAway(entry.homeAway || "home");
+    setEditorHomeAway(entry.homeAway || "");
     setEditorTime(entry.time || "");
+    setEditorGameType(entry.gameType || "season");
     setEditorOpen(true);
   };
-  const saveEditor = () => {
+  // Build the entry object that would be created/updated on save. Used by
+  // both saveEditor (returns to Schedule) and saveAndEdit (jumps to the
+  // Create-a-Lineup workflow with this entry preloaded).
+  const buildEntryFromForm = () => {
     const opp = editorOpponent.trim();
-    if (!opp) return;
-    const time = editorTime.trim() || null;
+    if (!opp || !editorTime || !editorHomeAway) return null;
     if (editorMode === "edit" && editorEntryId) {
-      setSchedule(prev => prev.map(e => e.id === editorEntryId ? { ...e, opponent: opp, homeAway: editorHomeAway, time } : e));
+      const existing = schedule.find(e => e.id === editorEntryId) || {};
+      return { ...existing, id: editorEntryId, opponent: opp, homeAway: editorHomeAway, time: editorTime, gameType: editorGameType || "season" };
+    }
+    return {
+      id: "sch_" + Date.now() + "_" + Math.floor(Math.random() * 1000),
+      date: editorDate,
+      kind: "game",
+      opponent: opp,
+      homeAway: editorHomeAway,
+      time: editorTime,
+      gameType: editorGameType || "season",
+    };
+  };
+  const saveEditor = () => {
+    const entry = buildEntryFromForm();
+    if (!entry) return;
+    if (editorMode === "edit" && editorEntryId) {
+      setSchedule(prev => prev.map(e => e.id === editorEntryId ? entry : e));
     } else {
-      setSchedule(prev => [...prev, {
-        id: "sch_" + Date.now() + "_" + Math.floor(Math.random() * 1000),
-        date: editorDate,
-        kind: "game",
-        opponent: opp,
-        homeAway: editorHomeAway,
-        time,
-      }]);
+      setSchedule(prev => [...prev, entry]);
     }
     setEditorOpen(false);
+  };
+  // "Add & Edit" / "Save & Edit" — same write as saveEditor, then jumps
+  // straight to the lineup-building flow with this entry preloaded.
+  const saveAndEdit = () => {
+    const entry = buildEntryFromForm();
+    if (!entry) return;
+    if (editorMode === "edit" && editorEntryId) {
+      setSchedule(prev => prev.map(e => e.id === editorEntryId ? entry : e));
+    } else {
+      setSchedule(prev => [...prev, entry]);
+    }
+    setEditorOpen(false);
+    if (typeof onOpenGame === "function") onOpenGame(entry);
   };
   const setAsPractice = () => {
     const time = editorTime.trim() || null;
@@ -4043,7 +4307,8 @@ function ScheduleTab({ schedule, setSchedule, roster, onOpenGame, canEdit = true
           opponent={editorOpponent} setOpponent={setEditorOpponent}
           homeAway={editorHomeAway} setHomeAway={setEditorHomeAway}
           time={editorTime} setTime={setEditorTime}
-          onSave={saveEditor} onDelete={deleteEditor}
+          gameType={editorGameType} setGameType={setEditorGameType}
+          onSave={saveEditor} onSaveAndEdit={saveAndEdit} onDelete={deleteEditor}
           onSetAsPractice={setAsPractice}
           onCancel={() => setEditorOpen(false)}
         />
@@ -4202,7 +4467,7 @@ function MonthGrid({ year, monthIdx, label, dayHeaders, byDate, pitcherNames, on
   );
 }
 
-function ScheduleEditorModal({ mode, kind, date, opponent, setOpponent, homeAway, setHomeAway, time, setTime, onSave, onDelete, onSetAsPractice, onCancel }) {
+function ScheduleEditorModal({ mode, kind, date, opponent, setOpponent, homeAway, setHomeAway, time, setTime, gameType, setGameType, onSave, onSaveAndEdit, onDelete, onSetAsPractice, onCancel }) {
   const dateLabel = (() => {
     try {
       const d = new Date(date + "T12:00:00");
@@ -4211,6 +4476,12 @@ function ScheduleEditorModal({ mode, kind, date, opponent, setOpponent, homeAway
   })();
   const oppValid = opponent.trim().length > 0;
   const isPracticeEdit = mode === "edit" && kind === "practice";
+  // Game form requires opponent + time + an explicit home/away choice. Practice
+  // form skips opponent/homeAway entirely so it only needs the time field if
+  // any (which we still leave optional for practices).
+  const formValid = isPracticeEdit
+    ? true
+    : (oppValid && !!time && !!homeAway);
 
   return (
     <div onClick={onCancel} style={{
@@ -4227,7 +4498,9 @@ function ScheduleEditorModal({ mode, kind, date, opponent, setOpponent, homeAway
         </h2>
         <div style={{ fontSize: 13, color: C.textMuted, marginBottom: 18 }}>{dateLabel}</div>
 
-        <label style={{ fontSize: 11, fontWeight: 600, color: C.textMuted, textTransform: "uppercase", letterSpacing: 0.5, display: "block", marginBottom: 6 }}>Time (optional)</label>
+        <label style={{ fontSize: 11, fontWeight: 600, color: C.textMuted, textTransform: "uppercase", letterSpacing: 0.5, display: "block", marginBottom: 6 }}>
+          Time {!isPracticeEdit && <span style={{ color: C.red }}>*</span>}{isPracticeEdit && <span style={{ textTransform: "none", letterSpacing: 0, fontWeight: 400 }}> (optional)</span>}
+        </label>
         <input type="time" value={time || ""} onChange={e => setTime(e.target.value)}
           style={{ width: "100%", padding: "8px 10px", border: `1px solid ${C.border}`, borderRadius: 6, fontFamily: FONT, fontSize: 14, color: C.text, background: C.surfaceAlt, marginBottom: 16 }} />
 
@@ -4243,10 +4516,10 @@ function ScheduleEditorModal({ mode, kind, date, opponent, setOpponent, homeAway
             <label style={{ fontSize: 11, fontWeight: 600, color: C.textMuted, textTransform: "uppercase", letterSpacing: 0.5, display: "block", marginBottom: 6 }}>Opponent</label>
             <input type="text" value={opponent} onChange={e => setOpponent(e.target.value)} placeholder="e.g. Burlington Bulls"
               autoFocus
-              onKeyDown={(e) => { if (e.key === "Enter" && oppValid) onSave(); }}
+              onKeyDown={(e) => { if (e.key === "Enter" && formValid) onSave(); }}
               style={{ width: "100%", padding: "8px 10px", border: `1px solid ${C.border}`, borderRadius: 6, fontFamily: FONT, fontSize: 14, color: C.text, background: C.surfaceAlt, marginBottom: 16 }} />
             <label style={{ fontSize: 11, fontWeight: 600, color: C.textMuted, textTransform: "uppercase", letterSpacing: 0.5, display: "block", marginBottom: 6 }}>Home / Away</label>
-            <div style={{ display: "flex", gap: 8, marginBottom: 22 }}>
+            <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
               {[{id:"home", label:"Home (vs)"}, {id:"away", label:"Away (@)"}].map(opt => (
                 <button key={opt.id} onClick={() => setHomeAway(opt.id)} style={{
                   flex: 1, padding: "8px 12px", borderRadius: 6, fontFamily: FONT, fontSize: 13, fontWeight: 500, cursor: "pointer",
@@ -4256,6 +4529,11 @@ function ScheduleEditorModal({ mode, kind, date, opponent, setOpponent, homeAway
                 }}>{opt.label}</button>
               ))}
             </div>
+            <label style={{ fontSize: 11, fontWeight: 600, color: C.textMuted, textTransform: "uppercase", letterSpacing: 0.5, display: "block", marginBottom: 6 }}>Game Type</label>
+            <select value={gameType || "season"} onChange={e => setGameType(e.target.value)}
+              style={{ width: "100%", padding: "8px 10px", border: `1px solid ${C.border}`, borderRadius: 6, fontFamily: FONT, fontSize: 14, color: C.text, background: C.surfaceAlt, marginBottom: 22, outline: "none" }}>
+              {GAME_TYPES.map(gt => <option key={gt.id} value={gt.id}>{gt.label}</option>)}
+            </select>
           </React.Fragment>
         )}
 
@@ -4272,13 +4550,22 @@ function ScheduleEditorModal({ mode, kind, date, opponent, setOpponent, homeAway
                 cursor: "pointer",
               }}>Save</button>
             ) : (
-              <button onClick={onSave} disabled={!oppValid} style={{
-                background: oppValid ? C.accent : C.borderLight,
-                border: `1px solid ${oppValid ? C.accent : C.border}`,
-                color: oppValid ? "#fff" : C.textMuted,
-                padding: "8px 14px", borderRadius: 6, fontFamily: FONT, fontSize: 13, fontWeight: 600,
-                cursor: oppValid ? "pointer" : "not-allowed",
-              }}>{mode === "edit" ? "Save" : "Add"}</button>
+              <React.Fragment>
+                <button onClick={onSave} disabled={!formValid} style={{
+                  background: formValid ? C.surface : C.borderLight,
+                  border: `1px solid ${formValid ? C.accent : C.border}`,
+                  color: formValid ? C.accent : C.textMuted,
+                  padding: "8px 14px", borderRadius: 6, fontFamily: FONT, fontSize: 13, fontWeight: 600,
+                  cursor: formValid ? "pointer" : "not-allowed",
+                }}>{mode === "edit" ? "Save" : "Add"}</button>
+                <button onClick={onSaveAndEdit} disabled={!formValid} title={mode === "edit" ? "Save and open this game in the lineup editor" : "Add this game and open it in the lineup editor"} style={{
+                  background: formValid ? C.accent : C.borderLight,
+                  border: `1px solid ${formValid ? C.accent : C.border}`,
+                  color: formValid ? "#fff" : C.textMuted,
+                  padding: "8px 14px", borderRadius: 6, fontFamily: FONT, fontSize: 13, fontWeight: 600,
+                  cursor: formValid ? "pointer" : "not-allowed",
+                }}>{mode === "edit" ? "Save & Edit" : "Add & Edit"}</button>
+              </React.Fragment>
             )}
           </div>
         </div>
