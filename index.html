@@ -1972,6 +1972,11 @@ function App() {
 
   useEffect(() => { save("dugout_roster", roster); save("dugout_roster_version", ROSTER_VERSION); }, [roster]);
   useEffect(() => { save("dugout_pitchLogs", pitchLogs); }, [pitchLogs]);
+  // Snap to the top of the page whenever the active tab changes. Tab switches
+  // (manual or programmatic — e.g. Generate Lineup → Lineup Editor, or opening
+  // a calendar entry → Setup) used to leave the page anchored at whatever
+  // scroll position the previous tab was on, which felt disorienting.
+  useEffect(() => { window.scrollTo(0, 0); }, [tab]);
 
   // Season schedule. Each entry: { id, date: "YYYY-MM-DD", opponent, homeAway,
   // gameType?, lineup? }. lineup, when present, is the saved game state for
@@ -2325,6 +2330,30 @@ function App() {
     ));
   };
 
+  // Delete the lineup attached to the active schedule entry (or the in-memory
+  // one-off lineup, if not linked). The game itself stays on the calendar so
+  // the coach can rebuild — only the saved positions/pitchers/catchers and
+  // the played flag are stripped. Pitch logs are NOT removed: those track
+  // historical innings and live in a separate bucket; coaches can clean them
+  // up from Arm Care if they really want a clean slate.
+  const handleDeleteLineup = () => {
+    if (currentScheduleId) {
+      setSchedule(prev => prev.map(e => {
+        if (e.id !== currentScheduleId) return e;
+        const { lineup, played, ...rest } = e;
+        return rest;
+      }));
+    }
+    setEditableGrid(null);
+    setPitcherAssignments([]);
+    setCatcherAssignments([]);
+    setAbsentIds([]);
+    setIsFinalized(false);
+    setWarnings([]);
+    setCurrentScheduleId(null);
+    setTab("schedule");
+  };
+
   const tabs = [
     { id:"schedule", label:"Schedule",        shortLabel:"Schedule" },
     { id:"setup",    label:"Create a Lineup", shortLabel:"Create" },
@@ -2398,8 +2427,8 @@ function App() {
           </div>
         )}
         {tab === "schedule" && <ScheduleTab schedule={schedule} setSchedule={setSchedule} roster={sortedRoster} onOpenGame={handleOpenScheduleEntry} />}
-        {tab === "roster" && <RosterTab roster={sortedRoster} setRoster={setRoster} schedule={schedule} pitchLogs={pitchLogs} setPitchLogs={setPitchLogs} />}
-        {tab === "setup" && <SetupTab roster={sortedRoster} availablePlayers={availablePlayers} absentIds={absentIds} setAbsentIds={setAbsentIds}
+        {tab === "roster" && <RosterTab roster={sortedRoster} setRoster={setRoster} schedule={schedule} pitchLogs={pitchLogs} setPitchLogs={setPitchLogs} benchTiers={benchTiers} setBenchTiers={setBenchTiers} />}
+        {tab === "setup" && <SetupTab roster={sortedRoster} setRoster={setRoster} availablePlayers={availablePlayers} absentIds={absentIds} setAbsentIds={setAbsentIds}
           pitcherAssignments={pitcherAssignments} setPitcherAssignments={setPitcherAssignments}
           catcherAssignments={catcherAssignments} setCatcherAssignments={setCatcherAssignments}
           benchTiers={benchTiers} setBenchTiers={setBenchTiers}
@@ -2418,6 +2447,7 @@ function App() {
           isPlayed={isPlayed}
           pitchLogsForGame={pitchLogsForGame}
           onSavePitchLog={handleSavePitchLog}
+          onDeleteLineup={handleDeleteLineup}
           onRevalidate={() => {
             if (!editableGrid) return;
             const w = validateLineup(editableGrid, computed.posHistory, availablePlayers, gameInnings, benchTiers);
@@ -2430,18 +2460,274 @@ function App() {
 }
 
 // ══════════════════════════════════════════════════
-// ROSTER TAB
+// PRIORITY MATRIX
+// Combined positional + bench priority editor. Rendered in both RosterTab
+// (Team Reports) and SetupTab (Create a Lineup) so edits in one place sync
+// to the other — both read the same App-level state (roster + benchTiers).
 // ══════════════════════════════════════════════════
-function RosterTab({ roster, setRoster, schedule = [], pitchLogs = [], setPitchLogs = () => {} }) {
+function PriorityMatrix({ roster, setRoster, benchTiers, setBenchTiers }) {
   const [showAdd, setShowAdd] = useState(false);
   const [name, setName] = useState("");
   const [number, setNumber] = useState("");
   const [newPosMap, setNewPosMap] = useState({});
+  const [newBenchTier, setNewBenchTier] = useState(DEFAULT_BENCH_TIER);
   const [editingId, setEditingId] = useState(null);
   const [editName, setEditName] = useState("");
   const [editNumber, setEditNumber] = useState("");
   const [confirmDelete, setConfirmDelete] = useState(null);
   const [priorityHelpOpen, setPriorityHelpOpen] = useState(false);
+
+  const cycleTier = (pos, map, setter) => {
+    const cur = map[pos] || null;
+    const idx = cur ? POS_TIERS.indexOf(cur) : -1;
+    const next = idx < POS_TIERS.length - 1 ? POS_TIERS[idx + 1] : null;
+    const updated = { ...map };
+    if (next) updated[pos] = next; else delete updated[pos];
+    setter(updated);
+  };
+  const addPlayer = () => {
+    if (!name.trim()) return;
+    const newId = Date.now().toString();
+    setRoster(prev => [...prev, { id: newId, name: name.trim(), number: number.trim(), positionMap: { ...newPosMap } }]);
+    if (newBenchTier !== DEFAULT_BENCH_TIER) {
+      setBenchTiers(prev => ({ ...prev, [newId]: newBenchTier }));
+    }
+    setName(""); setNumber(""); setNewPosMap({}); setNewBenchTier(DEFAULT_BENCH_TIER); setShowAdd(false);
+  };
+  const startEdit = (p) => { setEditingId(p.id); setEditName(p.name); setEditNumber(p.number); };
+  const saveEdit = (id) => { setRoster(prev => prev.map(p => p.id === id ? { ...p, name: editName, number: editNumber } : p)); setEditingId(null); };
+  const updatePlayerPos = (playerId, pos) => {
+    setRoster(prev => prev.map(p => {
+      if (p.id !== playerId) return p;
+      const map = { ...(p.positionMap || {}) };
+      // Strip any :N rank before cycling — tier cycling resets rank to 1
+      const cur = map[pos] ? map[pos].split(":")[0] : null;
+      const idx = cur ? POS_TIERS.indexOf(cur) : -1;
+      const next = idx < POS_TIERS.length - 1 ? POS_TIERS[idx + 1] : null;
+      if (next) map[pos] = next; else delete map[pos];
+      return { ...p, positionMap: map };
+    }));
+  };
+  const deletePlayer = (id) => {
+    setRoster(prev => prev.filter(p => p.id !== id));
+    // Clean up the matching bench-tier entry so we don't leak orphaned keys.
+    setBenchTiers(prev => { const next = { ...prev }; delete next[id]; return next; });
+    setConfirmDelete(null);
+  };
+  const resetRoster = () => {
+    if (!window.confirm("Reset roster to built-in defaults? This will overwrite any manual changes (including bench priorities).")) return;
+    setRoster(DEFAULT_ROSTER);
+    setBenchTiers(DEFAULT_BENCH_TIERS);
+  };
+
+  return (
+    <div>
+      <div style={{ marginBottom: 12 }}>
+        <h2 style={{ fontFamily: DISPLAY, fontSize: 18, fontWeight: 700, color: C.text, margin: 0, display: "flex", alignItems: "center", gap: 8 }}>
+          Roster Priority
+          <button onClick={() => setPriorityHelpOpen(true)} title="What is this?"
+            style={{ fontSize: 12, width: 22, height: 22, borderRadius: "50%",
+                     border: `1px solid ${C.border}`, background: C.surface, color: C.textMuted,
+                     cursor: "pointer", padding: 0, fontWeight: 700, lineHeight: 1, fontFamily: FONT }}>?</button>
+        </h2>
+        <div style={{ fontSize: 12, color: C.textMuted, marginTop: 4 }}>Tap a position cell to cycle a player's tier. Tap a Bench chip to set how often they sit.</div>
+      </div>
+
+      {priorityHelpOpen && (
+        <div onClick={() => setPriorityHelpOpen(false)} style={{
+          position: "fixed", inset: 0, background: "rgba(40,35,30,0.45)",
+          display: "flex", alignItems: "center", justifyContent: "center",
+          zIndex: 100, padding: 20,
+        }}>
+          <div onClick={(e) => e.stopPropagation()} style={{
+            background: C.surface, color: C.text, borderRadius: 12, padding: 24,
+            maxWidth: 460, width: "100%", fontFamily: FONT,
+            boxShadow: "0 10px 40px rgba(0,0,0,0.15)",
+          }}>
+            <h2 style={{ fontFamily: DISPLAY, fontSize: 18, fontWeight: 700, marginBottom: 12, color: C.text }}>Roster Priority</h2>
+            <p style={{ fontSize: 13, color: C.text, lineHeight: 1.55, marginBottom: 12 }}>
+              <strong>Position priority</strong> tells the lineup builder how to prioritize player positioning in a game.
+              It uses these rankings to break ties and field the strongest possible defensive alignment. Each player
+              should have a maximum of one primary position. Secondary positions are used to adjust for pitching,
+              catching, and bench time restrictions. Emergency roles are for players who are better used in other
+              positions but can be used when options are very limited.
+            </p>
+            <p style={{ fontSize: 13, color: C.text, lineHeight: 1.55, marginBottom: 18 }}>
+              <strong>Bench priority</strong> controls how often each player sits. <em>Regular</em> = normal rotation.
+              <em> Reduced</em> = sits more than normal. <em>Limited</em> = sits the most. Applies to all players
+              including pitchers (they sit when not on the mound).
+            </p>
+            <div style={{ display: "flex", justifyContent: "flex-end" }}>
+              <button onClick={() => setPriorityHelpOpen(false)} style={{
+                background: C.accent, border: `1px solid ${C.accent}`, color: "#fff",
+                padding: "8px 18px", borderRadius: 6, fontFamily: FONT, fontSize: 13, fontWeight: 600,
+                cursor: "pointer",
+              }}>Got it</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
+        <div style={{ fontSize: 12, color: C.textMuted, fontWeight: 500 }}>{roster.length} players</div>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button onClick={resetRoster} style={{
+            display: "inline-flex", alignItems: "center", gap: 4,
+            padding: "5px 10px", borderRadius: 6,
+            border: `1px solid ${C.border}`,
+            background: C.surfaceAlt, color: C.textMuted,
+            fontFamily: FONT, fontSize: 11, fontWeight: 500, cursor: "pointer",
+          }}>Reset</button>
+          <button onClick={() => setShowAdd(true)} style={{
+            display: "inline-flex", alignItems: "center", gap: 6,
+            padding: "5px 12px", borderRadius: 6, border: "none",
+            background: C.accent, color: "#fff",
+            fontFamily: FONT, fontSize: 12, fontWeight: 600, cursor: "pointer",
+            boxShadow: "0 1px 3px rgba(107,127,94,0.25)",
+          }}>
+            <span style={{ fontSize: 15, lineHeight: 1, marginTop: -1 }}>+</span>
+            <span>Add Player</span>
+          </button>
+        </div>
+      </div>
+
+      <div style={{ overflowX: "auto", borderRadius: 8, boxShadow: "0 1px 4px rgba(0,0,0,0.06)" }}>
+        <table style={{ width: "100%", borderCollapse: "collapse", background: C.surface, borderRadius: 8 }}>
+          <thead><tr>
+            <th style={{ ...thStyle, width: 44, textAlign: "center" }}>#</th>
+            <th style={{ ...thStyle, textAlign: "left", minWidth: 100, paddingLeft: 12 }}>Player</th>
+            {ALL_POS.map(pos => <th key={pos} style={{ ...thStyle, width: 42 }}>{pos}</th>)}
+            <th style={{ ...thStyle, minWidth: 150 }}>Bench</th>
+            <th style={{ ...thStyle, width: 54 }} />
+          </tr></thead>
+          <tbody>
+            {roster.map((p, i) => {
+              const bg = i % 2 === 0 ? C.surface : C.surfaceAlt;
+              const isEd = editingId === p.id;
+              const currentBenchTier = benchTiers[p.id] || DEFAULT_BENCH_TIER;
+              return (
+                <tr key={p.id}>
+                  <td style={{ ...tdStyle, background: bg, textAlign: "center", color: C.accent, fontWeight: 600 }}>
+                    {isEd ? <input value={editNumber} onChange={e => setEditNumber(e.target.value)} style={{ ...inputStyle, width: 36, textAlign: "center", padding: "4px" }} /> : p.number || "—"}
+                  </td>
+                  <td style={{ ...tdStyle, background: bg, fontWeight: 600, paddingLeft: 12 }}>
+                    {isEd ? <input value={editName} onChange={e => setEditName(e.target.value)} onKeyDown={e => e.key === "Enter" && saveEdit(p.id)} style={{ ...inputStyle, width: "100%", padding: "4px 8px" }} /> : p.name}
+                  </td>
+                  {ALL_POS.map(pos => {
+                    const tier = playerTier(p, pos);
+                    return (
+                      <td key={pos} style={{ ...tdStyle, background: bg, textAlign: "center", padding: "4px 2px" }}>
+                        <button onClick={() => updatePlayerPos(p.id, pos)} style={{
+                          width: 26, height: 22, borderRadius: 4, cursor: "pointer",
+                          border: tier ? `1.5px solid ${TIER_COLORS[tier]}` : `1px solid ${C.borderLight}`,
+                          background: tier ? TIER_BG[tier] : "transparent",
+                          display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto",
+                        }}>{tier && <span style={{ width: 7, height: 7, borderRadius: "50%", background: TIER_COLORS[tier] }} />}</button>
+                      </td>
+                    );
+                  })}
+                  <td style={{ ...tdStyle, background: bg, textAlign: "center", padding: "4px 6px" }}>
+                    <div style={{ display: "inline-flex", gap: 4 }}>
+                      {BENCH_TIERS.map(bt => (
+                        <button key={bt.id}
+                          onClick={() => setBenchTiers(prev => ({ ...prev, [p.id]: bt.id }))}
+                          title={`${bt.label} — ${bt.desc} (max ${bt.maxBench})`}
+                          style={{ ...miniChipStyle,
+                            background: currentBenchTier === bt.id ? bt.color : C.surface,
+                            color: currentBenchTier === bt.id ? "#fff" : C.textMuted,
+                            borderColor: currentBenchTier === bt.id ? bt.color : C.border,
+                            fontSize: 11, padding: "4px 9px",
+                          }}>{bt.label}</button>
+                      ))}
+                    </div>
+                  </td>
+                  <td style={{ ...tdStyle, background: bg, textAlign: "center" }}>
+                    {isEd ? (
+                      <button onClick={() => saveEdit(p.id)} style={{ ...miniChipStyle, color: C.greenText, borderColor: C.green }}>Done</button>
+                    ) : (
+                      <div style={{ display: "flex", gap: 4, justifyContent: "center" }}>
+                        <button onClick={() => startEdit(p)} style={{ ...miniChipStyle, color: C.textMuted }}>Edit</button>
+                        <button onClick={() => setConfirmDelete(p.id)} style={{ ...miniChipStyle, color: C.red, borderColor: C.red }}>&times;</button>
+                      </div>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+      <div style={{ display: "flex", gap: 16, marginTop: 12, fontSize: 12, color: C.textMuted, flexWrap: "wrap", alignItems: "center" }}>
+        <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+          {POS_TIERS.map(t => (
+            <div key={t} style={{ display: "flex", alignItems: "center", gap: 5 }}>
+              <span style={{ width: 8, height: 8, borderRadius: "50%", background: TIER_COLORS[t] }} />
+              {t.charAt(0).toUpperCase() + t.slice(1)}
+            </div>
+          ))}
+        </div>
+        <span style={{ color: C.textLight }}>{"·"}</span>
+        <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+          {BENCH_TIERS.map(bt => (
+            <div key={bt.id} style={{ display: "flex", alignItems: "center", gap: 5 }}>
+              <span style={{ width: 8, height: 8, borderRadius: "50%", background: bt.color }} />
+              {bt.label}
+            </div>
+          ))}
+        </div>
+        <span style={{ marginLeft: "auto", fontStyle: "italic", fontSize: 11 }}>Tap to cycle</span>
+      </div>
+
+      {confirmDelete && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.3)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 999, backdropFilter: "blur(2px)" }} onClick={() => setConfirmDelete(null)}>
+          <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, padding: 28, maxWidth: 320, boxShadow: "0 8px 30px rgba(0,0,0,0.12)" }} onClick={e => e.stopPropagation()}>
+            <div style={{ fontWeight: 600, marginBottom: 16, fontSize: 15 }}>Remove {roster.find(p => p.id === confirmDelete)?.name}?</div>
+            <div style={{ display: "flex", gap: 10 }}>
+              <button onClick={() => deletePlayer(confirmDelete)} style={{ ...chipStyle, background: C.red, borderColor: C.red, color: "#fff", padding: "8px 20px" }}>Remove</button>
+              <button onClick={() => setConfirmDelete(null)} style={{ ...chipStyle, padding: "8px 20px" }}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showAdd && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.3)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 999, backdropFilter: "blur(2px)" }} onClick={() => setShowAdd(false)}>
+          <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, padding: 24, width: "90%", maxWidth: 420, boxShadow: "0 8px 30px rgba(0,0,0,0.12)" }} onClick={e => e.stopPropagation()}>
+            <div style={{ fontFamily: DISPLAY, fontSize: 18, fontWeight: 700, color: C.accent, marginBottom: 16 }}>Add Player</div>
+            <div style={{ display: "flex", gap: 10, marginBottom: 14 }}>
+              <input placeholder="Name" value={name} onChange={e => setName(e.target.value)} onKeyDown={e => e.key === "Enter" && addPlayer()} style={{ ...inputStyle, flex: 1 }} />
+              <input placeholder="#" value={number} onChange={e => setNumber(e.target.value)} style={{ ...inputStyle, width: 56 }} />
+            </div>
+            <div style={{ fontSize: 12, color: C.textMuted, marginBottom: 8, fontWeight: 500 }}>Positions</div>
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 14 }}>
+              {ALL_POS.map(pos => {
+                const tier = newPosMap[pos];
+                return <button key={pos} onClick={() => cycleTier(pos, newPosMap, setNewPosMap)} style={{ ...chipStyle, padding: "6px 12px", background: tier ? TIER_BG[tier] : "transparent", borderColor: tier ? TIER_COLORS[tier] : C.border, color: tier ? TIER_COLORS[tier] : C.textMuted }}>{pos}</button>;
+              })}
+            </div>
+            <div style={{ fontSize: 12, color: C.textMuted, marginBottom: 8, fontWeight: 500 }}>Bench priority</div>
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 18 }}>
+              {BENCH_TIERS.map(bt => (
+                <button key={bt.id} onClick={() => setNewBenchTier(bt.id)} style={{
+                  ...chipStyle, padding: "6px 12px",
+                  background: newBenchTier === bt.id ? bt.color : C.surface,
+                  color: newBenchTier === bt.id ? "#fff" : C.textMuted,
+                  borderColor: newBenchTier === bt.id ? bt.color : C.border,
+                }}>{bt.label}</button>
+              ))}
+            </div>
+            <button onClick={addPlayer} style={{ width: "100%", padding: 10, background: C.accent, color: "#fff", border: "none", borderRadius: 6, fontFamily: FONT, fontSize: 14, fontWeight: 600, cursor: "pointer" }}>Add to Roster</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════
+// ROSTER TAB
+// ══════════════════════════════════════════════════
+function RosterTab({ roster, setRoster, schedule = [], pitchLogs = [], setPitchLogs = () => {}, benchTiers = {}, setBenchTiers = () => {} }) {
   // Date range for the Usage Report. Empty = whole season (no bound on that
   // side). Both bounds are inclusive ISO date strings (YYYY-MM-DD).
   const [usageStart, setUsageStart] = useState("");
@@ -2535,35 +2821,6 @@ function RosterTab({ roster, setRoster, schedule = [], pitchLogs = [], setPitchL
       {subtitle && <div style={{ fontSize: 12, color: C.textMuted, marginTop: 4 }}>{subtitle}</div>}
     </div>
   );
-
-  const cycleTier = (pos, map, setter) => {
-    const cur = map[pos] || null;
-    const idx = cur ? POS_TIERS.indexOf(cur) : -1;
-    const next = idx < POS_TIERS.length - 1 ? POS_TIERS[idx + 1] : null;
-    const updated = { ...map };
-    if (next) updated[pos] = next; else delete updated[pos];
-    setter(updated);
-  };
-  const addPlayer = () => {
-    if (!name.trim()) return;
-    setRoster(prev => [...prev, { id: Date.now().toString(), name: name.trim(), number: number.trim(), positionMap: { ...newPosMap } }]);
-    setName(""); setNumber(""); setNewPosMap({}); setShowAdd(false);
-  };
-  const startEdit = (p) => { setEditingId(p.id); setEditName(p.name); setEditNumber(p.number); };
-  const saveEdit = (id) => { setRoster(prev => prev.map(p => p.id === id ? { ...p, name: editName, number: editNumber } : p)); setEditingId(null); };
-  const updatePlayerPos = (playerId, pos) => {
-    setRoster(prev => prev.map(p => {
-      if (p.id !== playerId) return p;
-      const map = { ...(p.positionMap || {}) };
-      // Strip any :N rank before cycling — tier cycling resets rank to 1
-      const cur = map[pos] ? map[pos].split(":")[0] : null;
-      const idx = cur ? POS_TIERS.indexOf(cur) : -1;
-      const next = idx < POS_TIERS.length - 1 ? POS_TIERS[idx + 1] : null;
-      if (next) map[pos] = next; else delete map[pos];
-      return { ...p, positionMap: map };
-    }));
-  };
-  const deletePlayer = (id) => { setRoster(prev => prev.filter(p => p.id !== id)); setConfirmDelete(null); };
 
   return (
     <div>
@@ -2668,160 +2925,10 @@ function RosterTab({ roster, setRoster, schedule = [], pitchLogs = [], setPitchL
         </div>
       </div>
 
-      {/* Positional Priority (editable position-tier matrix) */}
-      <div style={{ marginBottom: 12 }}>
-        <h2 style={{ fontFamily: DISPLAY, fontSize: 18, fontWeight: 700, color: C.text, margin: 0, display: "flex", alignItems: "center", gap: 8 }}>
-          Positional Priority
-          <button onClick={() => setPriorityHelpOpen(true)} title="What is this?"
-            style={{ fontSize: 12, width: 22, height: 22, borderRadius: "50%",
-                     border: `1px solid ${C.border}`, background: C.surface, color: C.textMuted,
-                     cursor: "pointer", padding: 0, fontWeight: 700, lineHeight: 1, fontFamily: FONT }}>?</button>
-        </h2>
-        <div style={{ fontSize: 12, color: C.textMuted, marginTop: 4 }}>Tap any cell to cycle a player's tier at that position. Add, edit, or remove players.</div>
-      </div>
-
-      {priorityHelpOpen && (
-        <div onClick={() => setPriorityHelpOpen(false)} style={{
-          position: "fixed", inset: 0, background: "rgba(40,35,30,0.45)",
-          display: "flex", alignItems: "center", justifyContent: "center",
-          zIndex: 100, padding: 20,
-        }}>
-          <div onClick={(e) => e.stopPropagation()} style={{
-            background: C.surface, color: C.text, borderRadius: 12, padding: 24,
-            maxWidth: 460, width: "100%", fontFamily: FONT,
-            boxShadow: "0 10px 40px rgba(0,0,0,0.15)",
-          }}>
-            <h2 style={{ fontFamily: DISPLAY, fontSize: 18, fontWeight: 700, marginBottom: 12, color: C.text }}>Positional Priority</h2>
-            <p style={{ fontSize: 13, color: C.text, lineHeight: 1.55, marginBottom: 18 }}>
-              This tells the lineup builder how to prioritize player positioning in a game.
-              It will use these rankings to break ties and field the strongest possible
-              defensive alignment. Each player should have a maximum of one primary
-              position. Secondary positions will be used to adjust for pitching, catching,
-              and bench time restrictions. Emergency roles are for players who are better
-              used in other positions but can be used when options are very limited.
-            </p>
-            <div style={{ display: "flex", justifyContent: "flex-end" }}>
-              <button onClick={() => setPriorityHelpOpen(false)} style={{
-                background: C.accent, border: `1px solid ${C.accent}`, color: "#fff",
-                padding: "8px 18px", borderRadius: 6, fontFamily: FONT, fontSize: 13, fontWeight: 600,
-                cursor: "pointer",
-              }}>Got it</button>
-            </div>
-          </div>
-        </div>
-      )}
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
-        <div style={{ fontSize: 12, color: C.textMuted, fontWeight: 500 }}>{roster.length} players</div>
-        <div style={{ display: "flex", gap: 8 }}>
-          <button onClick={() => { if (window.confirm("Reset roster to built-in defaults? This will overwrite any manual changes.")) { setRoster(DEFAULT_ROSTER); } }} style={{
-            display: "inline-flex", alignItems: "center", gap: 4,
-            padding: "5px 10px", borderRadius: 6,
-            border: `1px solid ${C.border}`,
-            background: C.surfaceAlt, color: C.textMuted,
-            fontFamily: FONT, fontSize: 11, fontWeight: 500, cursor: "pointer",
-          }}>Reset</button>
-          <button onClick={() => setShowAdd(true)} style={{
-            display: "inline-flex", alignItems: "center", gap: 6,
-            padding: "5px 12px", borderRadius: 6, border: "none",
-            background: C.accent, color: "#fff",
-            fontFamily: FONT, fontSize: 12, fontWeight: 600, cursor: "pointer",
-            boxShadow: "0 1px 3px rgba(107,127,94,0.25)",
-          }}>
-            <span style={{ fontSize: 15, lineHeight: 1, marginTop: -1 }}>+</span>
-            <span>Add Player</span>
-          </button>
-        </div>
-      </div>
-      <div style={{ overflowX: "auto", borderRadius: 8, boxShadow: "0 1px 4px rgba(0,0,0,0.06)" }}>
-        <table style={{ width: "100%", borderCollapse: "collapse", background: C.surface, borderRadius: 8 }}>
-          <thead><tr>
-            <th style={{ ...thStyle, width: 44, textAlign: "center" }}>#</th>
-            <th style={{ ...thStyle, textAlign: "left", minWidth: 100, paddingLeft: 12 }}>Player</th>
-            {ALL_POS.map(pos => <th key={pos} style={{ ...thStyle, width: 42 }}>{pos}</th>)}
-            <th style={{ ...thStyle, width: 54 }} />
-          </tr></thead>
-          <tbody>
-            {roster.map((p, i) => {
-              const bg = i % 2 === 0 ? C.surface : C.surfaceAlt;
-              const isEd = editingId === p.id;
-              return (
-                <tr key={p.id}>
-                  <td style={{ ...tdStyle, background: bg, textAlign: "center", color: C.accent, fontWeight: 600 }}>
-                    {isEd ? <input value={editNumber} onChange={e => setEditNumber(e.target.value)} style={{ ...inputStyle, width: 36, textAlign: "center", padding: "4px" }} /> : p.number || "\u2014"}
-                  </td>
-                  <td style={{ ...tdStyle, background: bg, fontWeight: 600, paddingLeft: 12 }}>
-                    {isEd ? <input value={editName} onChange={e => setEditName(e.target.value)} onKeyDown={e => e.key === "Enter" && saveEdit(p.id)} style={{ ...inputStyle, width: "100%", padding: "4px 8px" }} /> : p.name}
-                  </td>
-                  {ALL_POS.map(pos => {
-                    const tier = playerTier(p, pos);
-                    return (
-                      <td key={pos} style={{ ...tdStyle, background: bg, textAlign: "center", padding: "4px 2px" }}>
-                        <button onClick={() => updatePlayerPos(p.id, pos)} style={{
-                          width: 26, height: 22, borderRadius: 4, cursor: "pointer",
-                          border: tier ? `1.5px solid ${TIER_COLORS[tier]}` : `1px solid ${C.borderLight}`,
-                          background: tier ? TIER_BG[tier] : "transparent",
-                          display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto",
-                        }}>{tier && <span style={{ width: 7, height: 7, borderRadius: "50%", background: TIER_COLORS[tier] }} />}</button>
-                      </td>
-                    );
-                  })}
-                  <td style={{ ...tdStyle, background: bg, textAlign: "center" }}>
-                    {isEd ? (
-                      <button onClick={() => saveEdit(p.id)} style={{ ...miniChipStyle, color: C.greenText, borderColor: C.green }}>Done</button>
-                    ) : (
-                      <div style={{ display: "flex", gap: 4, justifyContent: "center" }}>
-                        <button onClick={() => startEdit(p)} style={{ ...miniChipStyle, color: C.textMuted }}>Edit</button>
-                        <button onClick={() => setConfirmDelete(p.id)} style={{ ...miniChipStyle, color: C.red, borderColor: C.red }}>&times;</button>
-                      </div>
-                    )}
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
-      </div>
-      <div style={{ display: "flex", gap: 16, marginTop: 12, fontSize: 12, color: C.textMuted }}>
-        {POS_TIERS.map(t => (
-          <div key={t} style={{ display: "flex", alignItems: "center", gap: 5 }}>
-            <span style={{ width: 8, height: 8, borderRadius: "50%", background: TIER_COLORS[t] }} />
-            {t.charAt(0).toUpperCase() + t.slice(1)}
-          </div>
-        ))}
-        <span style={{ marginLeft: "auto", fontStyle: "italic", fontSize: 11 }}>Tap dots to cycle</span>
-      </div>
-
-      {confirmDelete && (
-        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.3)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 999, backdropFilter: "blur(2px)" }} onClick={() => setConfirmDelete(null)}>
-          <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, padding: 28, maxWidth: 320, boxShadow: "0 8px 30px rgba(0,0,0,0.12)" }} onClick={e => e.stopPropagation()}>
-            <div style={{ fontWeight: 600, marginBottom: 16, fontSize: 15 }}>Remove {roster.find(p => p.id === confirmDelete)?.name}?</div>
-            <div style={{ display: "flex", gap: 10 }}>
-              <button onClick={() => deletePlayer(confirmDelete)} style={{ ...chipStyle, background: C.red, borderColor: C.red, color: "#fff", padding: "8px 20px" }}>Remove</button>
-              <button onClick={() => setConfirmDelete(null)} style={{ ...chipStyle, padding: "8px 20px" }}>Cancel</button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {showAdd && (
-        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.3)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 999, backdropFilter: "blur(2px)" }} onClick={() => setShowAdd(false)}>
-          <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, padding: 24, width: "90%", maxWidth: 420, boxShadow: "0 8px 30px rgba(0,0,0,0.12)" }} onClick={e => e.stopPropagation()}>
-            <div style={{ fontFamily: DISPLAY, fontSize: 18, fontWeight: 700, color: C.accent, marginBottom: 16 }}>Add Player</div>
-            <div style={{ display: "flex", gap: 10, marginBottom: 14 }}>
-              <input placeholder="Name" value={name} onChange={e => setName(e.target.value)} onKeyDown={e => e.key === "Enter" && addPlayer()} style={{ ...inputStyle, flex: 1 }} />
-              <input placeholder="#" value={number} onChange={e => setNumber(e.target.value)} style={{ ...inputStyle, width: 56 }} />
-            </div>
-            <div style={{ fontSize: 12, color: C.textMuted, marginBottom: 8, fontWeight: 500 }}>Positions</div>
-            <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 18 }}>
-              {ALL_POS.map(pos => {
-                const tier = newPosMap[pos];
-                return <button key={pos} onClick={() => cycleTier(pos, newPosMap, setNewPosMap)} style={{ ...chipStyle, padding: "6px 12px", background: tier ? TIER_BG[tier] : "transparent", borderColor: tier ? TIER_COLORS[tier] : C.border, color: tier ? TIER_COLORS[tier] : C.textMuted }}>{pos}</button>;
-              })}
-            </div>
-            <button onClick={addPlayer} style={{ width: "100%", padding: 10, background: C.accent, color: "#fff", border: "none", borderRadius: 6, fontFamily: FONT, fontSize: 14, fontWeight: 600, cursor: "pointer" }}>Add to Roster</button>
-          </div>
-        </div>
-      )}
+      {/* Roster Priority \u2014 combined positional + bench priority editor.
+          Same component is rendered in SetupTab; both read App-level state
+          so edits in either place are reflected in the other. */}
+      <PriorityMatrix roster={roster} setRoster={setRoster} benchTiers={benchTiers} setBenchTiers={setBenchTiers} />
     </div>
   );
 }
@@ -3028,7 +3135,7 @@ function ArmCareTab({ roster, pitchLogs, setPitchLogs, canEdit = true }) {
 // ══════════════════════════════════════════════════
 // SETUP TAB (no CF restriction)
 // ══════════════════════════════════════════════════
-function SetupTab({ roster, availablePlayers, absentIds, setAbsentIds, pitcherAssignments, setPitcherAssignments, catcherAssignments, setCatcherAssignments, benchTiers, setBenchTiers, pitcherAvailability, gameInnings, setGameInnings, gameMeta, setGameMeta, onGenerate }) {
+function SetupTab({ roster, setRoster, availablePlayers, absentIds, setAbsentIds, pitcherAssignments, setPitcherAssignments, catcherAssignments, setCatcherAssignments, benchTiers, setBenchTiers, pitcherAvailability, gameInnings, setGameInnings, gameMeta, setGameMeta, onGenerate }) {
   // On phone, the heavier planning sections start collapsed so the page
   // doesn't open as one long scroll. Tap a section title to expand.
   const isMobile = useIsMobile();
@@ -3233,33 +3340,12 @@ function SetupTab({ roster, availablePlayers, absentIds, setAbsentIds, pitcherAs
         </div>
       </Section>
 
-      <Section title="Bench Priority" defaultOpen={!isMobile}>
-        <div style={{ fontSize: 13, color: C.textMuted, marginBottom: 14 }}>Controls who sits more vs less. Applies to all players including pitchers (they sit when not on the mound).</div>
-        <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 16 }}>
-          {BENCH_TIERS.map(bt => (
-            <div key={bt.id} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: C.textMuted }}>
-              <span style={{ display: "inline-block", width: 10, height: 10, borderRadius: "50%", background: bt.color }} />
-              <span style={{ fontWeight: 600, color: bt.color }}>{bt.label}</span>
-              <span>{"\u2014"} {bt.desc} (max {bt.maxBench})</span>
-            </div>
-          ))}
-        </div>
-        <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-          {availablePlayers.map(p => {
-            const currentTier = benchTiers[p.id] || DEFAULT_BENCH_TIER;
-            return (
-              <div key={p.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "7px 0", borderBottom: `1px solid ${C.borderLight}` }}>
-                <span style={{ fontWeight: 600, minWidth: 85, fontSize: 13 }}>{p.name}</span>
-                <div style={{ display: "flex", gap: 4 }}>
-                  {BENCH_TIERS.map(bt => (
-                    <button key={bt.id} onClick={() => setBenchTiers(prev => ({ ...prev, [p.id]: bt.id }))} style={{ ...miniChipStyle, background: currentTier === bt.id ? bt.color : C.surface, color: currentTier === bt.id ? "#fff" : C.textMuted, borderColor: currentTier === bt.id ? bt.color : C.border, fontSize: 11, padding: "4px 9px" }}>{bt.label}</button>
-                  ))}
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      </Section>
+      {/* Roster Priority \u2014 same combined editor that lives on the Team
+          Reports tab. Rendered top-level (not inside a Section) so it's
+          visually identical in both places, per the "match exactly" spec. */}
+      <div style={{ marginTop: 14, marginBottom: 14 }}>
+        <PriorityMatrix roster={roster} setRoster={setRoster} benchTiers={benchTiers} setBenchTiers={setBenchTiers} />
+      </div>
 
       <div style={{ marginTop: 28, textAlign: "center" }}>
         <button onClick={onGenerate} disabled={!canGenerate} style={{
@@ -3285,9 +3371,14 @@ function SetupTab({ roster, availablePlayers, absentIds, setAbsentIds, pitcherAs
 // ══════════════════════════════════════════════════
 // LINEUP TAB (with swap, finalize, PNG, color summary)
 // ══════════════════════════════════════════════════
-function LineupTab({ grid, setGrid, posHistory, benchCount, roster, fullRoster, warnings, innings, pitcherAssignments, catcherAssignments, benchTiers, gameMeta, isFinalized, setIsFinalized, generationId, isLinkedToSchedule = false, isPlayed = false, pitchLogsForGame = [], onSavePitchLog = () => {}, onRevalidate, onBack, canEdit = true }) {
+function LineupTab({ grid, setGrid, posHistory, benchCount, roster, fullRoster, warnings, innings, pitcherAssignments, catcherAssignments, benchTiers, gameMeta, isFinalized, setIsFinalized, generationId, isLinkedToSchedule = false, isPlayed = false, pitchLogsForGame = [], onSavePitchLog = () => {}, onDeleteLineup = () => {}, onRevalidate, onBack, canEdit = true }) {
   const isMobile = useIsMobile();
   const [pitchLogModalOpen, setPitchLogModalOpen] = useState(false);
+  const [confirmDeleteLineup, setConfirmDeleteLineup] = useState(false);
+  // Celebratory "Lineup is saved." modal that pops on finalize. Holds the
+  // download shortcuts so the coach can grab a copy before heading to the
+  // dugout — closes via the "Play ball!" CTA.
+  const [savedModalOpen, setSavedModalOpen] = useState(false);
   const [swapSel, setSwapSel] = useState(null); // { innIdx, key, playerId }
   const [tickerIdx, setTickerIdx] = useState(0);
   const [dismissedMsgs, setDismissedMsgs] = useState(new Set());
@@ -3502,13 +3593,35 @@ function LineupTab({ grid, setGrid, posHistory, benchCount, roster, fullRoster, 
 
   const isSelected = (innIdx, key) => swapSel && swapSel.innIdx === innIdx && swapSel.key === key;
 
-  const handleFinalize = () => setIsFinalized(true);
+  const handleFinalize = () => { setIsFinalized(true); setSavedModalOpen(true); };
   const handleEdit = () => setIsFinalized(false);
+
+  // Filename builder for downloaded artifacts. Produces names like
+  // `lineup-png-whitby-may07.png` so a coach with a folder full of exports
+  // can spot the right one at a glance. Falls back to today's date if the
+  // game's date isn't set, and drops the opponent slug if no opponent.
+  const buildExportFilename = (kind, ext) => {
+    const slug = (s) => (s || "").toString().trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+    const monthAbbr = ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"];
+    const oppSlug = slug(gameMeta?.opponent);
+    let dateShort = "";
+    const dateRaw = gameMeta?.date;
+    if (dateRaw && /^\d{4}-\d{2}-\d{2}$/.test(dateRaw)) {
+      const m = monthAbbr[parseInt(dateRaw.slice(5, 7), 10) - 1] || "";
+      const d = dateRaw.slice(8, 10);
+      if (m) dateShort = m + d;
+    }
+    if (!dateShort) {
+      const today = new Date();
+      dateShort = monthAbbr[today.getMonth()] + String(today.getDate()).padStart(2, "0");
+    }
+    return ["lineup", kind, oppSlug, dateShort].filter(Boolean).join("-") + ext;
+  };
 
   const handleDownloadPNG = () => {
     const dataUrl = generatePNG(grid, posHistory, roster, innings);
     const link = document.createElement("a");
-    link.download = `dugout-lineup-${new Date().toISOString().slice(0, 10)}.png`;
+    link.download = buildExportFilename("png", ".png");
     link.href = dataUrl;
     link.click();
   };
@@ -3597,10 +3710,9 @@ function LineupTab({ grid, setGrid, posHistory, benchCount, roster, fullRoster, 
 
     const blob = new Blob([html], { type: "text/html" });
     const url = URL.createObjectURL(blob);
-    const filename = ["dugout-gameday", datePart, oppSlug].filter(Boolean).join("-") + ".html";
     const link = document.createElement("a");
     link.href = url;
-    link.download = filename;
+    link.download = buildExportFilename("html", ".html");
     link.click();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
@@ -3720,8 +3832,49 @@ function LineupTab({ grid, setGrid, posHistory, benchCount, roster, fullRoster, 
     return style;
   };
 
+  // Friendly date string for the game header below: "Sat, May 7" rather than
+  // the raw ISO. Mirrors the formatting used by LogPitchesModal.
+  const gameDateLabel = (() => {
+    if (!gameMeta?.date) return "";
+    try {
+      const d = new Date(gameMeta.date + "T12:00:00");
+      return d.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
+    } catch { return gameMeta.date; }
+  })();
+  const gameTypeLabel = gameMeta?.gameType
+    ? (GAME_TYPES.find(gt => gt.id === gameMeta.gameType)?.label || null)
+    : null;
+  const headerSubParts = [
+    gameDateLabel || null,
+    gameMeta?.time ? formatTime(gameMeta.time) : null,
+    gameTypeLabel,
+  ].filter(Boolean);
+  const showGameHeader = !!(gameMeta?.opponent || gameMeta?.date);
+
   return (
     <div>
+      {/* Game header — opponent + date + time + type pinned at the top so the
+          coach knows which game they're editing, especially when bouncing
+          between several entries from the schedule in one session. */}
+      {showGameHeader && (
+        <div style={{ marginBottom: 14, padding: "10px 14px", background: C.surface, border: `1px solid ${C.border}`, borderRadius: 8, display: "flex", flexWrap: "wrap", alignItems: "baseline", gap: "4px 12px" }}>
+          {gameMeta?.opponent ? (
+            <span style={{ fontFamily: DISPLAY, fontSize: 18, fontWeight: 700, color: C.text }}>
+              {gameMeta.homeAway === "away" ? "@ " : "vs "}{gameMeta.opponent}
+            </span>
+          ) : (
+            <span style={{ fontFamily: DISPLAY, fontSize: 18, fontWeight: 700, color: C.textMuted, fontStyle: "italic" }}>
+              Untitled game
+            </span>
+          )}
+          {headerSubParts.length > 0 && (
+            <span style={{ fontSize: 13, color: C.textMuted }}>
+              {headerSubParts.join(" · ")}
+            </span>
+          )}
+        </div>
+      )}
+
       {/* Validation ticker — sticky at top so you can cycle through issues while swapping */}
       {false && canEdit && activeTicker && (() => {
         const sevColor = activeTicker.severity === "high" ? C.red : activeTicker.severity === "med" ? C.orange : C.textMuted;
@@ -4017,7 +4170,12 @@ function LineupTab({ grid, setGrid, posHistory, benchCount, roster, fullRoster, 
         gap: 10, marginTop: 28, flexWrap: "wrap",
       }}>
         <button onClick={onBack} style={{ ...chipStyle, padding: "10px 28px", background: C.surface, borderColor: C.accent, color: C.accent, fontSize: 14, fontWeight: 600 }}>{"\u2190"} {canEdit ? "Back to Setup" : "Back to Schedule"}</button>
-        <button onClick={handleExportGameDay} style={{ ...chipStyle, padding: "10px 28px", fontSize: 14, fontWeight: 600 }}>Download Gameday HTML</button>
+        {canEdit && grid && (
+          <button onClick={() => setConfirmDeleteLineup(true)}
+            style={{ ...chipStyle, padding: "10px 28px", background: C.surface, borderColor: C.red, color: C.redText, fontSize: 14, fontWeight: 600 }}>
+            Delete Lineup
+          </button>
+        )}
         {canEdit && isLinkedToSchedule && (
           <button onClick={() => setPitchLogModalOpen(true)} style={{
             ...chipStyle, padding: "10px 28px", fontSize: 14, fontWeight: 600,
@@ -4057,6 +4215,43 @@ function LineupTab({ grid, setGrid, posHistory, benchCount, roster, fullRoster, 
           onSave={(entries) => { onSavePitchLog(entries); setPitchLogModalOpen(false); }}
           onCancel={() => setPitchLogModalOpen(false)}
         />
+      )}
+
+      {savedModalOpen && (
+        <div onClick={() => setSavedModalOpen(false)} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.3)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 999, backdropFilter: "blur(2px)" }}>
+          <div onClick={(e) => e.stopPropagation()} style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, padding: 32, maxWidth: 380, width: "90%", boxShadow: "0 8px 30px rgba(0,0,0,0.12)", textAlign: "center" }}>
+            <div style={{ fontFamily: DISPLAY, fontSize: 22, fontWeight: 700, color: C.text, marginBottom: 22 }}>Lineup is saved.</div>
+            <div style={{ display: "flex", gap: 10, justifyContent: "center", flexWrap: "wrap", marginBottom: 22 }}>
+              <button onClick={handleExportGameDay} style={{ ...chipStyle, padding: "10px 20px", fontWeight: 600, fontSize: 13 }}>Download HTML</button>
+              <button onClick={handleDownloadPNG} style={{ ...chipStyle, padding: "10px 20px", fontWeight: 600, fontSize: 13 }}>Download PNG</button>
+            </div>
+            <button onClick={() => setSavedModalOpen(false)} style={{
+              background: C.accent, border: `1px solid ${C.accent}`, color: "#fff",
+              padding: "12px 40px", borderRadius: 8, fontFamily: FONT, fontSize: 15, fontWeight: 700,
+              cursor: "pointer", letterSpacing: 0.3,
+              boxShadow: "0 4px 14px rgba(107,127,94,0.3)",
+            }}>Play ball!</button>
+          </div>
+        </div>
+      )}
+
+      {confirmDeleteLineup && (
+        <div onClick={() => setConfirmDeleteLineup(false)} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.3)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 999, backdropFilter: "blur(2px)" }}>
+          <div onClick={(e) => e.stopPropagation()} style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, padding: 28, maxWidth: 380, width: "90%", boxShadow: "0 8px 30px rgba(0,0,0,0.12)" }}>
+            <div style={{ fontFamily: DISPLAY, fontSize: 17, fontWeight: 700, color: C.text, marginBottom: 10 }}>Delete this lineup?</div>
+            <div style={{ fontSize: 13, color: C.textMuted, lineHeight: 1.5, marginBottom: 20 }}>
+              {isLinkedToSchedule
+                ? "This clears the saved positions, pitchers, and catchers. The game stays on the schedule and any logged pitch counts are kept."
+                : "This clears the current positions, pitchers, and catchers and returns you to the schedule."}
+            </div>
+            <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
+              <button onClick={() => setConfirmDeleteLineup(false)}
+                style={{ ...chipStyle, padding: "8px 20px" }}>Cancel</button>
+              <button onClick={() => { setConfirmDeleteLineup(false); onDeleteLineup(); }}
+                style={{ ...chipStyle, background: C.red, borderColor: C.red, color: "#fff", padding: "8px 20px", fontWeight: 600 }}>Delete Lineup</button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );
