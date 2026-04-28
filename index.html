@@ -240,6 +240,23 @@ const CAT_COLORS = {
 // position has multiple players at the same tier; it's omitted otherwise.
 // Bump ROSTER_VERSION whenever DEFAULT_ROSTER changes so localStorage auto-resets.
 const ROSTER_VERSION = 3;
+
+// One-time wipe of stale per-game data (schedule entries, pitch logs, the
+// active gameMeta shell). Bump DATA_VERSION whenever you want every device
+// to drop accumulated test artifacts on next load. Roster + benchTiers are
+// preserved since they're team config, not per-game data.
+const DATA_VERSION = 1;
+(function clearStaleGameData() {
+  try {
+    const v = parseInt(localStorage.getItem("dugout_data_version") || "0", 10);
+    if (v < DATA_VERSION) {
+      localStorage.removeItem("dugout_schedule");
+      localStorage.removeItem("dugout_pitchLogs");
+      localStorage.removeItem("dugout_gameMeta");
+      localStorage.setItem("dugout_data_version", String(DATA_VERSION));
+    }
+  } catch (e) {}
+})();
 const DEFAULT_ROSTER = [
   { id:"1",  name:"Benji",    number:"8",  positionMap:{ P:"preferred",SS:"preferred","1B":"secondary:2",C:"emergency:1" } },
   { id:"2",  name:"Everett",  number:"7",  positionMap:{ P:"preferred","3B":"preferred",SS:"secondary:1",CF:"secondary:1" } },
