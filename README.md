@@ -1,4 +1,4 @@
-# Dugout — 11U Lineup System
+# Lineup System
 
 Single-file HTML app for managing a baseball team's roster, arm care, season schedule, and per-game lineups. Built for an 11U OBA team. Runs entirely in the browser; state persists in `localStorage` per device.
 
