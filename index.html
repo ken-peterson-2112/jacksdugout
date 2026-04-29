@@ -2732,6 +2732,11 @@ function RosterTab({ roster, setRoster, schedule = [], pitchLogs = [], setPitchL
   // side). Both bounds are inclusive ISO date strings (YYYY-MM-DD).
   const [usageStart, setUsageStart] = useState("");
   const [usageEnd,   setUsageEnd]   = useState("");
+  // "total" = raw inning counts; "perGame" = avg innings per game the player
+  // actually appeared in (any position or bench, excluding total no-shows).
+  const [usageMode, setUsageMode] = useState("total");
+  // Sort: column id ("number", "name", or one of USAGE_COLS) + direction.
+  const [usageSort, setUsageSort] = useState({ col: "number", dir: "asc" });
 
   // Past games (strictly before wall-clock today) that have a saved lineup
   // AND fall within the chosen date range. Empty range bounds = no limit on
@@ -2747,32 +2752,111 @@ function RosterTab({ roster, setRoster, schedule = [], pitchLogs = [], setPitchL
     });
   }, [schedule, usageStart, usageEnd]);
 
-  // Inning counts per (player, position).
-  const usageByPlayer = useMemo(() => {
-    const result = {};
-    roster.forEach(p => { result[p.id] = {}; });
+  // Columns shown in the usage chart: pitching, all field positions, then bench.
+  const USAGE_COLS = useMemo(() => [...ALL_POS, "BN"], []);
+
+  // Inning counts per (player, position) — including BN (bench) — plus
+  // games-played per player for the per-game-average mode. A player counts
+  // as having played in a game if they appear at any position OR on the
+  // bench in any inning of that game.
+  const { usageByPlayer, gamesByPlayer } = useMemo(() => {
+    const usage = {};
+    const games = {};
+    roster.forEach(p => { usage[p.id] = {}; games[p.id] = 0; });
     includedGames.forEach(g => {
+      const seen = new Set();
       g.lineup.grid.forEach(inn => {
         ALL_POS.forEach(pos => {
           const pid = inn[pos];
-          if (pid && result[pid]) result[pid][pos] = (result[pid][pos] || 0) + 1;
+          if (pid && usage[pid]) {
+            usage[pid][pos] = (usage[pid][pos] || 0) + 1;
+            seen.add(pid);
+          }
+        });
+        (inn.BN || []).forEach(pid => {
+          if (usage[pid]) {
+            usage[pid].BN = (usage[pid].BN || 0) + 1;
+            seen.add(pid);
+          }
         });
       });
+      seen.forEach(pid => { games[pid] = (games[pid] || 0) + 1; });
     });
-    return result;
+    return { usageByPlayer: usage, gamesByPlayer: games };
   }, [roster, includedGames]);
 
-  // Usage range for the heatmap colors below. Computed across all (player,
-  // position) cells with a non-zero count.
+  // Value shown in a cell, respecting the Total / Per-Game toggle.
+  const cellValue = (pid, col) => {
+    const raw = (usageByPlayer[pid] || {})[col] || 0;
+    if (raw === 0) return 0;
+    if (usageMode === "total") return raw;
+    const gp = gamesByPlayer[pid] || 0;
+    return gp > 0 ? raw / gp : 0;
+  };
+  const formatCell = v => {
+    if (!v) return null;
+    return usageMode === "total" ? String(Math.round(v)) : v.toFixed(1);
+  };
+
+  // Heatmap range across whatever the current mode displays.
   const usageRange = useMemo(() => {
     let min = Infinity, max = 0;
-    Object.values(usageByPlayer).forEach(byPos => {
-      Object.values(byPos).forEach(n => {
-        if (n > 0) { if (n < min) min = n; if (n > max) max = n; }
+    roster.forEach(p => {
+      USAGE_COLS.forEach(col => {
+        const v = cellValue(p.id, col);
+        if (v > 0) { if (v < min) min = v; if (v > max) max = v; }
       });
     });
     return { min: min === Infinity ? 0 : min, max };
-  }, [usageByPlayer]);
+  }, [roster, usageByPlayer, gamesByPlayer, usageMode, USAGE_COLS]);
+
+  // Roster ordered by the active sort column / direction.
+  const sortedUsageRoster = useMemo(() => {
+    const rows = [...roster];
+    const dir = usageSort.dir === "desc" ? -1 : 1;
+    if (usageSort.col === "number") {
+      rows.sort((a, b) => {
+        const na = parseInt(a.number, 10);
+        const nb = parseInt(b.number, 10);
+        if (Number.isNaN(na) && Number.isNaN(nb)) return 0;
+        if (Number.isNaN(na)) return 1;
+        if (Number.isNaN(nb)) return -1;
+        return (na - nb) * dir;
+      });
+    } else if (usageSort.col === "name") {
+      rows.sort((a, b) => (a.name || "").localeCompare(b.name || "") * dir);
+    } else {
+      rows.sort((a, b) => {
+        const va = cellValue(a.id, usageSort.col);
+        const vb = cellValue(b.id, usageSort.col);
+        if (va !== vb) return (va - vb) * dir;
+        // Tiebreak by jersey number ascending so order stays stable.
+        const na = parseInt(a.number, 10);
+        const nb = parseInt(b.number, 10);
+        if (Number.isNaN(na) && Number.isNaN(nb)) return 0;
+        if (Number.isNaN(na)) return 1;
+        if (Number.isNaN(nb)) return -1;
+        return na - nb;
+      });
+    }
+    return rows;
+  }, [roster, usageSort, usageByPlayer, gamesByPlayer, usageMode]);
+
+  const handleUsageSort = (col) => {
+    setUsageSort(prev => {
+      if (prev.col === col) return { col, dir: prev.dir === "desc" ? "asc" : "desc" };
+      // Default: text columns ascending, numeric columns descending (hi→lo).
+      return { col, dir: (col === "number" || col === "name") ? "asc" : "desc" };
+    });
+  };
+  const sortArrow = (col) => {
+    if (usageSort.col !== col) return null;
+    return (
+      <span style={{ marginLeft: 2, color: C.accent, fontSize: 9 }}>
+        {usageSort.dir === "desc" ? "▼" : "▲"}
+      </span>
+    );
+  };
 
   // Conditional-format gradient for the Usage Report cells:
   //   lowest non-zero count → cool light blue
@@ -2840,6 +2924,25 @@ function RosterTab({ roster, setRoster, schedule = [], pitchLogs = [], setPitchL
             <button onClick={() => { setUsageStart(""); setUsageEnd(""); }}
               style={{ ...miniChipStyle, fontSize: 11, padding: "3px 10px" }}>Whole season</button>
           )}
+          <span style={{ fontSize: 12, color: C.textMuted, fontWeight: 500, marginLeft: 12 }}>Show:</span>
+          <div style={{ display: "inline-flex", gap: 4 }}>
+            {[
+              { id: "total",   label: "Total" },
+              { id: "perGame", label: "Per Game" },
+            ].map(opt => {
+              const active = usageMode === opt.id;
+              return (
+                <button key={opt.id} onClick={() => setUsageMode(opt.id)}
+                  title={opt.id === "perGame" ? "Average innings per game the player actually appeared in" : "Total innings across all included games"}
+                  style={{ ...miniChipStyle,
+                    background: active ? C.accent : C.surface,
+                    color: active ? "#fff" : C.textMuted,
+                    borderColor: active ? C.accent : C.border,
+                    fontSize: 11, padding: "3px 10px",
+                  }}>{opt.label}</button>
+              );
+            })}
+          </div>
           <span style={{ fontSize: 11, color: C.textMuted, marginLeft: "auto" }}>
             {includedGames.length} {includedGames.length === 1 ? "game" : "games"} included
           </span>
@@ -2847,29 +2950,40 @@ function RosterTab({ roster, setRoster, schedule = [], pitchLogs = [], setPitchL
         <div style={{ overflowX: "auto", borderRadius: 8, boxShadow: "0 1px 4px rgba(0,0,0,0.06)", background: C.surface }}>
           <table style={{ width: "auto", borderCollapse: "collapse", background: C.surface, borderRadius: 8 }}>
             <thead><tr>
-              <th style={{ ...thStyle, width: 36, textAlign: "center", padding: "6px 4px" }}>#</th>
-              <th style={{ ...thStyle, textAlign: "left", width: 130, paddingLeft: 10, padding: "6px 4px 6px 10px" }}>Player</th>
-              {ALL_POS.map(pos => <th key={pos} style={{ ...thStyle, width: 36, padding: "6px 2px" }}>{pos}</th>)}
+              <th onClick={() => handleUsageSort("number")}
+                style={{ ...thStyle, width: 36, textAlign: "center", padding: "6px 4px", cursor: "pointer", userSelect: "none" }}>
+                #{sortArrow("number")}
+              </th>
+              <th onClick={() => handleUsageSort("name")}
+                style={{ ...thStyle, textAlign: "left", width: 130, paddingLeft: 10, padding: "6px 4px 6px 10px", cursor: "pointer", userSelect: "none" }}>
+                Player{sortArrow("name")}
+              </th>
+              {USAGE_COLS.map(col => (
+                <th key={col} onClick={() => handleUsageSort(col)}
+                  style={{ ...thStyle, width: 36, padding: "6px 2px", cursor: "pointer", userSelect: "none" }}>
+                  {col}{sortArrow(col)}
+                </th>
+              ))}
             </tr></thead>
             <tbody>
-              {roster.map((p, i) => {
+              {sortedUsageRoster.map((p, i) => {
                 const bg = i % 2 === 0 ? C.surface : C.surfaceAlt;
-                const usage = usageByPlayer[p.id] || {};
                 return (
                   <tr key={p.id}>
                     <td style={{ ...tdStyle, background: bg, textAlign: "center", color: C.accent, fontWeight: 600, padding: "3px 2px", fontSize: 12 }}>{p.number || "—"}</td>
                     <td style={{ ...tdStyle, background: bg, fontWeight: 600, padding: "3px 2px 3px 10px", fontSize: 13 }}>{p.name}</td>
-                    {ALL_POS.map(pos => {
-                      const count = usage[pos] || 0;
-                      const heat = count > 0 ? heatColor(count, usageRange.min, usageRange.max) : null;
+                    {USAGE_COLS.map(col => {
+                      const value = cellValue(p.id, col);
+                      const heat = value > 0 ? heatColor(value, usageRange.min, usageRange.max) : null;
+                      const display = formatCell(value);
                       return (
-                        <td key={pos} style={{
+                        <td key={col} style={{
                           ...tdStyle, textAlign: "center", padding: "3px 2px",
                           background: heat || bg,
-                          color: count > 0 ? C.text : C.textLight,
-                          fontWeight: count > 0 ? 700 : 400,
+                          color: value > 0 ? C.text : C.textLight,
+                          fontWeight: value > 0 ? 700 : 400,
                           fontSize: 12,
-                        }}>{count > 0 ? count : "—"}</td>
+                        }}>{display || "—"}</td>
                       );
                     })}
                   </tr>
