@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-  <title>Jacks — 11U 2026</title>
+  <title>Dugout — 11U OBA</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
@@ -1933,6 +1933,78 @@ function generatePNG(grid, posHistory, roster, innings, gameMeta = {}) {
 }
 
 // ══════════════════════════════════════════════════
+// EXPORT HELPERS
+// PNG / Gameday-HTML downloaders, callable from anywhere — used both by
+// the in-editor download buttons and by the Lineups list view's per-card
+// quick-export buttons. Lifted out of LineupTab so a saved schedule entry
+// can be exported without first loading it into the editor.
+// ══════════════════════════════════════════════════
+function buildExportFilename(gameMeta, kind, ext) {
+  const slug = (s) => (s || "").toString().trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  const monthAbbr = ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"];
+  const oppSlug = slug(gameMeta?.opponent);
+  let dateShort = "";
+  const dateRaw = gameMeta?.date;
+  if (dateRaw && /^\d{4}-\d{2}-\d{2}$/.test(dateRaw)) {
+    const m = monthAbbr[parseInt(dateRaw.slice(5, 7), 10) - 1] || "";
+    const d = dateRaw.slice(8, 10);
+    if (m) dateShort = m + d;
+  }
+  if (!dateShort) {
+    const today = new Date();
+    dateShort = monthAbbr[today.getMonth()] + String(today.getDate()).padStart(2, "0");
+  }
+  return ["lineup", kind, oppSlug, dateShort].filter(Boolean).join("-") + ext;
+}
+
+function downloadPNGForLineup({ grid, posHistory, roster, innings, gameMeta }) {
+  const dataUrl = generatePNG(grid, posHistory, roster, innings, gameMeta);
+  const link = document.createElement("a");
+  link.download = buildExportFilename(gameMeta, "png", ".png");
+  link.href = dataUrl;
+  link.click();
+}
+
+function downloadGameDayHTMLForLineup({ grid, roster, innings, gameMeta }) {
+  const meta = gameMeta || {};
+  const slug = (s) => (s || "").toString().trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  const datePart = meta.date || new Date().toISOString().slice(0, 10);
+  const oppSlug = slug(meta.opponent);
+  const gameId = ["game", datePart, oppSlug].filter(Boolean).join("-");
+
+  const playerMini = (p) => ({ id: p.id, name: p.name, number: p.number, positionMap: p.positionMap });
+  const payload = {
+    gameId,
+    meta: {
+      date: meta.date || null,
+      opponent: meta.opponent || null,
+      gameType: meta.gameType || null,
+    },
+    innings,
+    roster: roster.map(playerMini),
+    grid,
+  };
+
+  const titleParts = ["Lineup"];
+  if (meta.opponent) titleParts.push("vs " + meta.opponent);
+  if (meta.date) titleParts.push("— " + meta.date);
+  const title = titleParts.join(" ");
+
+  const tmpl = atob(GAME_DAY_TEMPLATE_B64);
+  const html = tmpl
+    .replace("__GAME_TITLE__", title.replace(/[<>&]/g, c => ({"<":"&lt;",">":"&gt;","&":"&amp;"}[c])))
+    .replace("__GAME_DATA__", JSON.stringify(payload));
+
+  const blob = new Blob([html], { type: "text/html" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = buildExportFilename(gameMeta, "html", ".html");
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+// ══════════════════════════════════════════════════
 // LOGIN SCREEN
 // Magic-link auth: enter email → click link in inbox → signed in.
 // ══════════════════════════════════════════════════
@@ -2742,10 +2814,23 @@ function App() {
             const w = validateLineup(editableGrid, computed.posHistory, availablePlayers, gameInnings, benchTiers);
             setWarnings(w);
           }}
-          onBack={() => setTab("setup")}
+          onBack={() => {
+            // Schedule-linked editor → return to the Lineups list (clear the
+            // active edit so LineupTab's `if (!grid)` branch fires). One-off
+            // lineups (no schedule entry) fall back to the Setup tab where
+            // they were generated, since the list won't have an entry for them.
+            if (currentScheduleId) {
+              setEditableGrid(null);
+              setCurrentScheduleId(null);
+              setWarnings([]);
+            } else {
+              setTab("setup");
+            }
+          }}
           prevGame={prevGame}
           nextGame={nextGame}
-          onNavigateToGame={handleOpenScheduleEntry} />}
+          onNavigateToGame={handleOpenScheduleEntry}
+          schedule={schedule} />}
       </div>
       <TeamDataModal
         open={teamDataModalOpen}
@@ -3827,9 +3912,175 @@ function SetupTab({ roster, setRoster, availablePlayers, absentIds, setAbsentIds
 }
 
 // ══════════════════════════════════════════════════
+// LINEUP LIST VIEW
+// Default state of the Lineup Editor tab when no specific game is being
+// edited. Renders one card per game-with-saved-lineup, sorted by date,
+// with the planned pitchers + catchers prominent and quick actions for
+// Edit / Download PNG / Download Gameday HTML.
+// ══════════════════════════════════════════════════
+function LineupListView({ schedule, roster, onEditEntry }) {
+  const games = useMemo(() => {
+    return (schedule || [])
+      .filter(g => g && g.kind === "game" && g.lineup && Array.isArray(g.lineup.grid))
+      .slice()
+      .sort((a, b) => {
+        if (a.date !== b.date) return a.date < b.date ? -1 : 1;
+        const ta = a.time || "";
+        const tb = b.time || "";
+        return ta < tb ? -1 : ta > tb ? 1 : 0;
+      });
+  }, [schedule]);
+
+  const playerMap = useMemo(() => {
+    const m = {};
+    (roster || []).forEach(p => { m[p.id] = p; });
+    return m;
+  }, [roster]);
+  const playerName = (id) => playerMap[id]?.name || "?";
+
+  const formatDate = (iso) => {
+    if (!iso) return "";
+    try {
+      const d = new Date(iso + "T12:00:00");
+      return d.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric", year: "numeric" });
+    } catch { return iso; }
+  };
+  const formatTime12 = (t) => {
+    if (!t) return "";
+    const [hStr, mStr] = t.split(":");
+    let h = parseInt(hStr, 10);
+    if (Number.isNaN(h)) return t;
+    const am = h < 12;
+    const h12 = h === 0 ? 12 : h > 12 ? h - 12 : h;
+    return `${h12}:${mStr || "00"} ${am ? "AM" : "PM"}`;
+  };
+
+  if (games.length === 0) {
+    return (
+      <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 8, padding: 32, textAlign: "center" }}>
+        <div style={{ fontFamily: DISPLAY, fontSize: 18, fontWeight: 700, color: C.text, marginBottom: 8 }}>No lineups yet</div>
+        <div style={{ fontSize: 13, color: C.textMuted, lineHeight: 1.55 }}>
+          Build your first lineup from the <strong>Schedule</strong> tab (tap a game) or the <strong>Create a Lineup</strong> tab. Saved lineups will show up here.
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <div style={{ marginBottom: 14, fontSize: 13, color: C.textMuted, display: "flex", alignItems: "baseline", gap: 8 }}>
+        <span style={{ fontFamily: DISPLAY, fontSize: 18, fontWeight: 700, color: C.text }}>Lineups</span>
+        <span>· {games.length} saved</span>
+      </div>
+      <div style={{ display: "grid", gap: 14, gridTemplateColumns: "1fr" }}>
+        {games.map(entry => {
+          const lineup = entry.lineup || {};
+          const pitchers = lineup.pitcherAssignments || [];
+          const catchers = lineup.catcherAssignments || [];
+          const innings = lineup.gameInnings || (Array.isArray(lineup.grid) ? lineup.grid.length : 6);
+          const grid = lineup.grid;
+          const gameMeta = {
+            date: entry.date,
+            time: entry.time,
+            opponent: entry.opponent,
+            homeAway: entry.homeAway,
+            gameType: entry.gameType,
+          };
+          const { posHistory } = recomputeFromGrid(grid, roster);
+
+          const subParts = [];
+          if (entry.date) subParts.push(formatDate(entry.date));
+          if (entry.time) subParts.push(formatTime12(entry.time));
+          if (entry.gameType) subParts.push(entry.gameType.charAt(0).toUpperCase() + entry.gameType.slice(1));
+          if (entry.played) subParts.push("Played");
+          if (lineup.isFinalized) subParts.push("Finalized");
+
+          return (
+            <div key={entry.id} style={{
+              background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10,
+              padding: "16px 18px", boxShadow: "0 1px 3px rgba(0,0,0,0.04)",
+            }}>
+              {/* Game header — opponent prominent, meta line below */}
+              <div style={{ marginBottom: 14 }}>
+                <div style={{ display: "flex", flexWrap: "wrap", alignItems: "baseline", gap: "4px 12px" }}>
+                  {entry.opponent ? (
+                    <span style={{ fontFamily: DISPLAY, fontSize: 19, fontWeight: 700, color: C.text }}>
+                      {entry.homeAway === "away" ? "@ " : "vs "}{entry.opponent}
+                    </span>
+                  ) : (
+                    <span style={{ fontFamily: DISPLAY, fontSize: 19, fontWeight: 700, color: C.textMuted, fontStyle: "italic" }}>
+                      Untitled game
+                    </span>
+                  )}
+                  {subParts.length > 0 && (
+                    <span style={{ fontSize: 13, color: C.textMuted }}>
+                      {subParts.join(" · ")}
+                    </span>
+                  )}
+                </div>
+              </div>
+
+              {/* Pitchers + Catchers — side-by-side on desktop, stacked on narrow screens */}
+              <div style={{ display: "grid", gap: 14, gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", marginBottom: 16 }}>
+                <div>
+                  <div style={{ fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.5, color: C.textMuted, marginBottom: 6 }}>
+                    Pitchers ({pitchers.reduce((s, p) => s + (p.innings || 0), 0)}/{innings} inn)
+                  </div>
+                  {pitchers.length === 0 ? (
+                    <div style={{ fontSize: 12, color: C.textLight, fontStyle: "italic" }}>(none assigned)</div>
+                  ) : pitchers.map((pa, i) => (
+                    <div key={pa.id} style={{ fontSize: 13, color: C.text, lineHeight: 1.7, display: "flex", alignItems: "baseline", gap: 6 }}>
+                      <span style={{ color: C.accent, fontWeight: 700, minWidth: 16 }}>{i + 1}.</span>
+                      <span style={{ fontWeight: 600 }}>{playerName(pa.id)}</span>
+                      <span style={{ color: C.textMuted, fontSize: 12 }}>
+                        {pa.innings} inn{pa.budget ? ` · ${pa.budget}p` : ""}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+                <div>
+                  <div style={{ fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.5, color: C.textMuted, marginBottom: 6 }}>
+                    Catchers ({catchers.reduce((s, c) => s + (c.innings || 0), 0)}/{innings} inn)
+                  </div>
+                  {catchers.length === 0 ? (
+                    <div style={{ fontSize: 12, color: C.textLight, fontStyle: "italic" }}>(none assigned)</div>
+                  ) : catchers.map((ca, i) => (
+                    <div key={ca.id} style={{ fontSize: 13, color: C.text, lineHeight: 1.7, display: "flex", alignItems: "baseline", gap: 6 }}>
+                      <span style={{ color: C.accent, fontWeight: 700, minWidth: 16 }}>{i + 1}.</span>
+                      <span style={{ fontWeight: 600 }}>{playerName(ca.id)}</span>
+                      <span style={{ color: C.textMuted, fontSize: 12 }}>{ca.innings} inn</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* Action row */}
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                <button onClick={() => onEditEntry(entry)} style={{
+                  background: C.accent, border: `1px solid ${C.accent}`, color: "#fff",
+                  padding: "8px 18px", borderRadius: 6, fontFamily: FONT, fontSize: 13, fontWeight: 600, cursor: "pointer",
+                }}>Edit</button>
+                <button onClick={() => downloadPNGForLineup({ grid, posHistory, roster, innings, gameMeta })} style={{
+                  background: C.surface, border: `1px solid ${C.border}`, color: C.text,
+                  padding: "8px 16px", borderRadius: 6, fontFamily: FONT, fontSize: 13, fontWeight: 500, cursor: "pointer",
+                }}>Download PNG</button>
+                <button onClick={() => downloadGameDayHTMLForLineup({ grid, roster, innings, gameMeta })} style={{
+                  background: C.surface, border: `1px solid ${C.border}`, color: C.text,
+                  padding: "8px 16px", borderRadius: 6, fontFamily: FONT, fontSize: 13, fontWeight: 500, cursor: "pointer",
+                }}>Download Gameday HTML</button>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════
 // LINEUP TAB (with swap, finalize, PNG, color summary)
 // ══════════════════════════════════════════════════
-function LineupTab({ grid, setGrid, posHistory, benchCount, roster, fullRoster, warnings, innings, pitcherAssignments, catcherAssignments, benchTiers, gameMeta, isFinalized, setIsFinalized, generationId, isLinkedToSchedule = false, isPlayed = false, pitchLogsForGame = [], onSavePitchLog = () => {}, onDeleteLineup = () => {}, onRevalidate, onBack, canEdit = true, prevGame = null, nextGame = null, onNavigateToGame = () => {} }) {
+function LineupTab({ grid, setGrid, posHistory, benchCount, roster, fullRoster, warnings, innings, pitcherAssignments, catcherAssignments, benchTiers, gameMeta, isFinalized, setIsFinalized, generationId, isLinkedToSchedule = false, isPlayed = false, pitchLogsForGame = [], onSavePitchLog = () => {}, onDeleteLineup = () => {}, onRevalidate, onBack, canEdit = true, prevGame = null, nextGame = null, onNavigateToGame = () => {}, schedule = [] }) {
   const isMobile = useIsMobile();
   const [pitchLogModalOpen, setPitchLogModalOpen] = useState(false);
   const [confirmDeleteLineup, setConfirmDeleteLineup] = useState(false);
@@ -3938,11 +4189,15 @@ function LineupTab({ grid, setGrid, posHistory, benchCount, roster, fullRoster, 
   };
 
   if (!grid) {
+    // No active edit — show the Lineups list (overview of every saved game).
+    // The card "Edit" button calls back into the App's schedule-loader,
+    // which sets the active grid and flips this branch off on the next render.
     return (
-      <div style={{ textAlign: "center", padding: 48, color: C.textMuted }}>
-        <div style={{ fontFamily: DISPLAY, fontSize: 18, marginBottom: 12 }}>No lineup generated yet</div>
-        {canEdit && <button onClick={onBack} style={{ ...chipStyle, background: C.accent, color: "#fff", borderColor: C.accent, padding: "8px 20px" }}>Go to Setup</button>}
-      </div>
+      <LineupListView
+        schedule={schedule}
+        roster={fullRoster || roster}
+        onEditEntry={onNavigateToGame}
+      />
     );
   }
 
@@ -4054,34 +4309,11 @@ function LineupTab({ grid, setGrid, posHistory, benchCount, roster, fullRoster, 
   const handleFinalize = () => { setIsFinalized(true); setSavedModalOpen(true); };
   const handleEdit = () => setIsFinalized(false);
 
-  // Filename builder for downloaded artifacts. Produces names like
-  // `lineup-png-whitby-may07.png` so a coach with a folder full of exports
-  // can spot the right one at a glance. Falls back to today's date if the
-  // game's date isn't set, and drops the opponent slug if no opponent.
-  const buildExportFilename = (kind, ext) => {
-    const slug = (s) => (s || "").toString().trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
-    const monthAbbr = ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"];
-    const oppSlug = slug(gameMeta?.opponent);
-    let dateShort = "";
-    const dateRaw = gameMeta?.date;
-    if (dateRaw && /^\d{4}-\d{2}-\d{2}$/.test(dateRaw)) {
-      const m = monthAbbr[parseInt(dateRaw.slice(5, 7), 10) - 1] || "";
-      const d = dateRaw.slice(8, 10);
-      if (m) dateShort = m + d;
-    }
-    if (!dateShort) {
-      const today = new Date();
-      dateShort = monthAbbr[today.getMonth()] + String(today.getDate()).padStart(2, "0");
-    }
-    return ["lineup", kind, oppSlug, dateShort].filter(Boolean).join("-") + ext;
-  };
-
+  // Wrappers around the module-level export helpers. The shared helpers
+  // are also called directly from the Lineups list view so coaches can
+  // export saved games without entering the editor.
   const handleDownloadPNG = () => {
-    const dataUrl = generatePNG(grid, posHistory, roster, innings, gameMeta);
-    const link = document.createElement("a");
-    link.download = buildExportFilename("png", ".png");
-    link.href = dataUrl;
-    link.click();
+    downloadPNGForLineup({ grid, posHistory, roster, innings, gameMeta });
   };
 
   // Export the complete lineup as a structured JSON file. Includes game metadata,
@@ -4134,45 +4366,7 @@ function LineupTab({ grid, setGrid, posHistory, benchCount, roster, fullRoster, 
   // cells with a small dot, and persists changes in localStorage. A "reset to
   // plan" button restores the original lineup. No network, no dependencies.
   const handleExportGameDay = () => {
-    const meta = gameMeta || {};
-    const slug = (s) => (s || "").toString().trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
-    const datePart = meta.date || new Date().toISOString().slice(0, 10);
-    const oppSlug = slug(meta.opponent);
-    const gameId = ["game", datePart, oppSlug].filter(Boolean).join("-");
-
-    // Stripped-down roster: only the fields the exported file actually needs.
-    const playerMini = (p) => ({ id: p.id, name: p.name, number: p.number, positionMap: p.positionMap });
-    const payload = {
-      gameId,
-      meta: {
-        date: meta.date || null,
-        opponent: meta.opponent || null,
-        gameType: meta.gameType || null,
-      },
-      innings,
-      roster: roster.map(playerMini),
-      grid,
-    };
-
-    // Build a friendly title — falls back gracefully when no opponent is set.
-    const titleParts = ["Lineup"];
-    if (meta.opponent) titleParts.push("vs " + meta.opponent);
-    if (meta.date) titleParts.push("— " + meta.date);
-    const title = titleParts.join(" ");
-
-    // Decode template from base64 and substitute placeholders.
-    const tmpl = atob(GAME_DAY_TEMPLATE_B64);
-    const html = tmpl
-      .replace("__GAME_TITLE__", title.replace(/[<>&]/g, c => ({"<":"&lt;",">":"&gt;","&":"&amp;"}[c])))
-      .replace("__GAME_DATA__", JSON.stringify(payload));
-
-    const blob = new Blob([html], { type: "text/html" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = buildExportFilename("html", ".html");
-    link.click();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    downloadGameDayHTMLForLineup({ grid, roster, innings, gameMeta });
   };
 
   // Open a minimal new window containing only the inning-by-inning position grid
@@ -4327,6 +4521,18 @@ function LineupTab({ grid, setGrid, posHistory, benchCount, roster, fullRoster, 
 
   return (
     <div>
+      {/* Breadcrumb back to the Lineups list — only meaningful when this
+          lineup is tied to a schedule entry (the list pulls from saved
+          schedule games). For one-off lineups the user gets to Setup via
+          the bottom action row instead. */}
+      {isLinkedToSchedule && (
+        <button onClick={onBack} style={{
+          background: "transparent", border: "none", color: C.textMuted,
+          fontSize: 12, fontFamily: FONT, cursor: "pointer", padding: "0 0 6px 0",
+          display: "inline-flex", alignItems: "center", gap: 4, fontWeight: 500,
+        }}>{"← "}All lineups</button>
+      )}
+
       {/* Prev/next nav between games with saved lineups. Hidden when this
           lineup isn't tied to a schedule entry, or when there's only one
           game in the season so there's nothing to navigate to. */}
@@ -4675,7 +4881,7 @@ function LineupTab({ grid, setGrid, posHistory, benchCount, roster, fullRoster, 
         alignItems: isMobile ? "stretch" : "center",
         gap: 10, marginTop: 28, flexWrap: "wrap",
       }}>
-        <button onClick={onBack} style={{ ...chipStyle, padding: "10px 28px", background: C.surface, borderColor: C.accent, color: C.accent, fontSize: 14, fontWeight: 600 }}>{"\u2190"} {canEdit ? "Back to Setup" : "Back to Schedule"}</button>
+        <button onClick={onBack} style={{ ...chipStyle, padding: "10px 28px", background: C.surface, borderColor: C.accent, color: C.accent, fontSize: 14, fontWeight: 600 }}>{"\u2190"} {isLinkedToSchedule ? "All lineups" : (canEdit ? "Back to Setup" : "Back to Schedule")}</button>
         {canEdit && grid && (
           <button onClick={() => setConfirmDeleteLineup(true)}
             style={{ ...chipStyle, padding: "10px 28px", background: C.surface, borderColor: C.red, color: C.redText, fontSize: 14, fontWeight: 600 }}>
