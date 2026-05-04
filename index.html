@@ -3023,8 +3023,15 @@ function RosterTab({ roster, setRoster, schedule = [], pitchLogs = [], setPitchL
     () => includeProjected ? [...playedGames, ...projectedGames] : playedGames,
     [playedGames, projectedGames, includeProjected]
   );
+  // When true, every cell shows innings-per-game (count / N games included)
+  // instead of the raw inning count. Heatmap colors stay tied to the raw
+  // counts so the visual ranking doesn't shift between modes.
+  const [showAverage, setShowAverage] = useState(false);
 
-  // Inning counts per (player, position).
+  // Inning counts per (player, position), plus a synthetic BN bucket for
+  // bench innings. BN is tracked separately so it can render without a
+  // heatmap — bench totals naturally skew higher than per-position innings
+  // and would otherwise flatten the position-cell gradient.
   const usageByPlayer = useMemo(() => {
     const result = {};
     roster.forEach(p => { result[p.id] = {}; });
@@ -3034,22 +3041,35 @@ function RosterTab({ roster, setRoster, schedule = [], pitchLogs = [], setPitchL
           const pid = inn[pos];
           if (pid && result[pid]) result[pid][pos] = (result[pid][pos] || 0) + 1;
         });
+        (inn.BN || []).forEach(pid => {
+          if (pid && result[pid]) result[pid].BN = (result[pid].BN || 0) + 1;
+        });
       });
     });
     return result;
   }, [roster, includedGames]);
 
-  // Usage range for the heatmap colors below. Computed across all (player,
-  // position) cells with a non-zero count.
+  // Usage range for the heatmap colors below. ALL_POS only — BN is excluded
+  // so the bench column doesn't dominate the gradient.
   const usageRange = useMemo(() => {
     let min = Infinity, max = 0;
     Object.values(usageByPlayer).forEach(byPos => {
-      Object.values(byPos).forEach(n => {
-        if (n > 0) { if (n < min) min = n; if (n > max) max = n; }
+      ALL_POS.forEach(pos => {
+        const n = byPos[pos];
+        if (n && n > 0) { if (n < min) min = n; if (n > max) max = n; }
       });
     });
     return { min: min === Infinity ? 0 : min, max };
   }, [usageByPlayer]);
+
+  // Cell display formatter. Honors the Avg-per-game toggle.
+  const formatUsage = (count) => {
+    if (!count) return "—";
+    if (showAverage && includedGames.length > 0) {
+      return (count / includedGames.length).toFixed(1);
+    }
+    return String(count);
+  };
 
   // Conditional-format gradient for the Usage Report cells:
   //   lowest non-zero count → cool light blue
@@ -3105,7 +3125,7 @@ function RosterTab({ roster, setRoster, schedule = [], pitchLogs = [], setPitchL
           games. Tighter padding than the editable Roster table since it's
           read-only and we want the whole grid on screen at once. */}
       <div style={{ marginBottom: 28 }}>
-        {sectionHeader("Usage Report", "Innings each player has played at each position across saved lineups. Toggle Include projected to fold in future games.")}
+        {sectionHeader("Usage Report", "Innings each player has played at each position across saved lineups. Toggles let you fold in future planned games and switch the cell display between totals and averages per game.")}
         <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10, flexWrap: "wrap" }}>
           <span style={{ fontSize: 12, color: C.textMuted, fontWeight: 500 }}>Range:</span>
           <input type="date" value={usageStart} onChange={e => setUsageStart(e.target.value)}
@@ -3127,6 +3147,16 @@ function RosterTab({ roster, setRoster, schedule = [], pitchLogs = [], setPitchL
             }}>
             {includeProjected ? "✓ " : ""}Include projected
           </button>
+          <button onClick={() => setShowAverage(v => !v)}
+            title="Show innings per game (cell ÷ N games included) instead of raw totals"
+            style={{
+              ...miniChipStyle, fontSize: 11, padding: "3px 10px",
+              background: showAverage ? C.accent : C.surface,
+              color: showAverage ? "#fff" : C.textMuted,
+              borderColor: showAverage ? C.accent : C.border,
+            }}>
+            {showAverage ? "✓ " : ""}Avg per game
+          </button>
           <span style={{ fontSize: 11, color: C.textMuted, marginLeft: "auto" }}>
             {includeProjected
               ? `${playedGames.length} played + ${projectedGames.length} projected`
@@ -3139,6 +3169,7 @@ function RosterTab({ roster, setRoster, schedule = [], pitchLogs = [], setPitchL
               <th style={{ ...thStyle, width: 36, textAlign: "center", padding: "6px 4px" }}>#</th>
               <th style={{ ...thStyle, textAlign: "left", width: 130, paddingLeft: 10, padding: "6px 4px 6px 10px" }}>Player</th>
               {ALL_POS.map(pos => <th key={pos} style={{ ...thStyle, width: 36, padding: "6px 2px" }}>{pos}</th>)}
+              <th title="Bench innings (no heatmap — bench totals are tracked but not heat-shaded)" style={{ ...thStyle, width: 40, padding: "6px 2px", borderLeft: `2px solid ${C.border}` }}>BN</th>
             </tr></thead>
             <tbody>
               {roster.map((p, i) => {
@@ -3158,9 +3189,23 @@ function RosterTab({ roster, setRoster, schedule = [], pitchLogs = [], setPitchL
                           color: count > 0 ? C.text : C.textLight,
                           fontWeight: count > 0 ? 700 : 400,
                           fontSize: 12,
-                        }}>{count > 0 ? count : "—"}</td>
+                        }}>{formatUsage(count)}</td>
                       );
                     })}
+                    {(() => {
+                      const count = usage.BN || 0;
+                      return (
+                        <td key="BN" style={{
+                          ...tdStyle, textAlign: "center", padding: "3px 2px",
+                          background: bg,
+                          color: count > 0 ? C.textMuted : C.textLight,
+                          fontWeight: count > 0 ? 600 : 400,
+                          fontSize: 12,
+                          fontStyle: "italic",
+                          borderLeft: `2px solid ${C.border}`,
+                        }}>{formatUsage(count)}</td>
+                      );
+                    })()}
                   </tr>
                 );
               })}
