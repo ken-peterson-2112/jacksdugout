@@ -1806,7 +1806,7 @@ function roundRect(ctx, x, y, w, h, r) {
   ctx.quadraticCurveTo(x, y, x+r, y); ctx.closePath();
 }
 
-function generatePNG(grid, posHistory, roster, innings) {
+function generatePNG(grid, posHistory, roster, innings, gameMeta = {}) {
   const canvas = document.createElement("canvas");
   const ctx = canvas.getContext("2d");
   const players = [...roster].sort((a, b) => parseInt(a.number) - parseInt(b.number));
@@ -1826,10 +1826,29 @@ function generatePNG(grid, posHistory, roster, innings) {
   ctx.fill();
   ctx.fillStyle = "#ffffff";
   ctx.font = "bold 22px Georgia, serif";
-  ctx.fillText("Dugout", pad + 16, pad + 26);
+  const title = "Jacks 11U AA";
+  ctx.fillText(title, pad + 16, pad + 26);
+  const titleW = ctx.measureText(title).width;
   ctx.font = "500 13px Inter, sans-serif";
-  ctx.fillText("11U OBA \u00B7 Game Lineup", pad + 110, pad + 26);
-  const dateStr = new Date().toLocaleDateString("en-US", { weekday:"short", month:"short", day:"numeric", year:"numeric" });
+  // Subtitle: opponent if known (with vs / @ prefix from homeAway). Anchored
+  // to the right edge of the title with a small gap so it works regardless
+  // of whatever the title text ends up being.
+  const opp = (gameMeta.opponent || "").trim();
+  const homeAway = gameMeta.homeAway === "away" ? "@" : "vs";
+  const subtitle = opp ? `${homeAway} ${opp}` : "Game Lineup";
+  ctx.fillText(subtitle, pad + 16 + titleW + 16, pad + 26);
+  // Date: prefer the game's date from gameMeta; fall back to today if missing.
+  // The "T12:00:00" suffix forces local-noon parsing so the displayed date
+  // doesn't drift across timezones.
+  let dateStr;
+  if (gameMeta.date) {
+    try {
+      const d = new Date(gameMeta.date + "T12:00:00");
+      dateStr = d.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric", year: "numeric" });
+    } catch { dateStr = gameMeta.date; }
+  } else {
+    dateStr = new Date().toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric", year: "numeric" });
+  }
   const dateW = ctx.measureText(dateStr).width;
   ctx.fillText(dateStr, pad + gridW - dateW - 16, pad + 26);
 
@@ -4030,7 +4049,7 @@ function LineupTab({ grid, setGrid, posHistory, benchCount, roster, fullRoster, 
   };
 
   const handleDownloadPNG = () => {
-    const dataUrl = generatePNG(grid, posHistory, roster, innings);
+    const dataUrl = generatePNG(grid, posHistory, roster, innings, gameMeta);
     const link = document.createElement("a");
     link.download = buildExportFilename("png", ".png");
     link.href = dataUrl;
