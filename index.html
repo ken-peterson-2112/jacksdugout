@@ -2422,9 +2422,12 @@ function App() {
       absentIds, innings: gameInnings, benchTiers, pins: [], attempts: 25,
     });
     if (!best) { alert("Couldn't produce any valid lineup. Check that pitchers/catchers are set and enough players are available."); return; }
-    if (best.fairnessViolation) {
-      alert(`Warning: couldn't find a lineup where bench time is within the fairness rule (max 2-inning spread). Showing the best attempt; consider adjusting bench tiers (e.g. mark more players Iron Man or Dev) and regenerate.`);
-    }
+    // Bench fairness alert disabled 2026-05-03 — the lineup editor's visual
+    // warnings (validation panel + bench-score badges) cover the same ground
+    // without an interruptive alert. To re-enable, uncomment the block below.
+    // if (best.fairnessViolation) {
+    //   alert(`Warning: couldn't find a lineup where bench time is within the fairness rule (max 2-inning spread). Showing the best attempt; consider adjusting bench tiers (e.g. mark more players Iron Man or Dev) and regenerate.`);
+    // }
     setEditableGrid(JSON.parse(JSON.stringify(best.result.grid)));
     setWarnings(best.scored.warnings);
     setIsFinalized(false);
@@ -3405,6 +3408,20 @@ function SetupTab({ roster, setRoster, availablePlayers, absentIds, setAbsentIds
   const addPitcher = (id) => { if (!pitcherAssignments.some(p => p.id === id)) setPitcherAssignments(prev => [...prev, { id, innings: 2, budget: 54 }]); };
   const removePitcher = (id) => setPitcherAssignments(prev => prev.filter(p => p.id !== id));
   const updatePitcher = (id, field, value) => setPitcherAssignments(prev => prev.map(p => p.id === id ? { ...p, [field]: value } : p));
+  // Pitcher reorder: HTML5 drag-and-drop on desktop, ↑/↓ buttons for touch.
+  // dragPitcherIdx tracks the source row; clears on drop or dragend.
+  const [dragPitcherIdx, setDragPitcherIdx] = useState(null);
+  const reorderPitcher = (fromIdx, toIdx) => {
+    if (fromIdx === toIdx || fromIdx == null || toIdx == null) return;
+    setPitcherAssignments(prev => {
+      if (fromIdx < 0 || fromIdx >= prev.length) return prev;
+      const clamped = Math.max(0, Math.min(toIdx, prev.length - 1));
+      const next = [...prev];
+      const [moved] = next.splice(fromIdx, 1);
+      next.splice(clamped, 0, moved);
+      return next;
+    });
+  };
   const addCatcher = (id) => { if (!catcherAssignments.some(c => c.id === id)) setCatcherAssignments(prev => [...prev, { id, innings: 3 }]); };
   const removeCatcher = (id) => setCatcherAssignments(prev => prev.filter(c => c.id !== id));
   const updateCatcher = (id, field, value) => setCatcherAssignments(prev => prev.map(c => c.id === id ? { ...c, [field]: value } : c));
@@ -3480,9 +3497,26 @@ function SetupTab({ roster, setRoster, availablePlayers, absentIds, setAbsentIds
         {pitcherAssignments.map((pa, idx) => {
           const player = roster.find(p => p.id === pa.id);
           const avail = pitcherAvailability[pa.id];
+          const isDragSource = dragPitcherIdx === idx;
           return (
-            <div key={pa.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 0", borderBottom: `1px solid ${C.borderLight}`, flexWrap: "wrap" }}>
-              <span style={{ color: C.accent, fontWeight: 700, width: 22, textAlign: "center", fontSize: 14 }}>{idx + 1}</span>
+            <div
+              key={pa.id}
+              draggable
+              onDragStart={(e) => { setDragPitcherIdx(idx); try { e.dataTransfer.effectAllowed = "move"; } catch {} }}
+              onDragOver={(e) => { if (dragPitcherIdx !== null) e.preventDefault(); }}
+              onDrop={(e) => { e.preventDefault(); if (dragPitcherIdx !== null && dragPitcherIdx !== idx) reorderPitcher(dragPitcherIdx, idx); setDragPitcherIdx(null); }}
+              onDragEnd={() => setDragPitcherIdx(null)}
+              title="Drag to reorder, or use the arrows on the right"
+              style={{
+                display: "flex", alignItems: "center", gap: 10,
+                padding: "10px 0", borderBottom: `1px solid ${C.borderLight}`,
+                flexWrap: "wrap", cursor: "grab",
+                opacity: isDragSource ? 0.4 : 1,
+                background: isDragSource ? C.surfaceAlt : "transparent",
+                transition: "opacity 0.1s, background 0.1s",
+              }}
+            >
+              <span style={{ color: C.accent, fontWeight: 700, width: 22, textAlign: "center", fontSize: 14, userSelect: "none" }}>{idx + 1}</span>
               <span style={{ fontWeight: 600, minWidth: 80, fontSize: 14 }}>{player?.name}</span>
               <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
                 <label style={{ fontSize: 12, color: C.textMuted }}>Inn:</label>
@@ -3500,7 +3534,13 @@ function SetupTab({ roster, setRoster, availablePlayers, absentIds, setAbsentIds
                 }}>{!avail.available ? "Unavailable" : avail.hasWarnings ? "Restricted" : "Available"}</span>
               )}
               <span style={{ fontSize: 11, color: C.textMuted }}>{"\u2192"} {getRestLabel(pa.budget)} rest</span>
-              <button onClick={() => removePitcher(pa.id)} style={{ ...miniChipStyle, color: C.red, borderColor: C.red, marginLeft: "auto" }}>&times;</button>
+              <div style={{ display: "flex", gap: 4, alignItems: "center", marginLeft: "auto" }}>
+                <button onClick={() => reorderPitcher(idx, idx - 1)} disabled={idx === 0} title="Move up"
+                  style={{ ...miniChipStyle, padding: "3px 8px", fontSize: 12, opacity: idx === 0 ? 0.3 : 1, cursor: idx === 0 ? "default" : "pointer" }}>{"\u2191"}</button>
+                <button onClick={() => reorderPitcher(idx, idx + 1)} disabled={idx === pitcherAssignments.length - 1} title="Move down"
+                  style={{ ...miniChipStyle, padding: "3px 8px", fontSize: 12, opacity: idx === pitcherAssignments.length - 1 ? 0.3 : 1, cursor: idx === pitcherAssignments.length - 1 ? "default" : "pointer" }}>{"\u2193"}</button>
+                <button onClick={() => removePitcher(pa.id)} title="Remove pitcher" style={{ ...miniChipStyle, color: C.red, borderColor: C.red }}>&times;</button>
+              </div>
               {avail && avail.warnings && avail.warnings.length > 0 && (
                 <div style={{ flexBasis: "100%", display: "flex", flexDirection: "column", gap: 2, marginLeft: 32, marginTop: -4 }}>
                   {avail.warnings.map((w, i) => (
@@ -4279,7 +4319,9 @@ function LineupTab({ grid, setGrid, posHistory, benchCount, roster, fullRoster, 
             <th style={thStyle}>POS</th>
             {Array.from({ length: innings }, (_, i) => (
               <th key={i} style={thStyle}>
-                <span>Inn {i + 1}</span>{inningStrength[i] && strengthChip(inningStrength[i].pct)}
+                {/* Strength % chip disabled 2026-05-03 — could be misread by other coaches.
+                    To re-enable, drop the `false &&` guard below. */}
+                <span>Inn {i + 1}</span>{false && inningStrength[i] && strengthChip(inningStrength[i].pct)}
               </th>
             ))}
           </tr></thead>
@@ -4313,7 +4355,8 @@ function LineupTab({ grid, setGrid, posHistory, benchCount, roster, fullRoster, 
               return (
                 <tr key={pos}>
                   <td style={{ ...tdStyle, fontWeight: 600, textAlign: "center", borderRight: `2px solid ${C.border}`, color: pos === "P" ? C.accent : C.text, background: C.surfaceAlt, whiteSpace: "nowrap" }}>
-                    <span>{pos}</span>{positionStrength[pos] && strengthChip(positionStrength[pos].pct)}
+                    {/* Strength % chip disabled 2026-05-03 — see note on inning header above. */}
+                    <span>{pos}</span>{false && positionStrength[pos] && strengthChip(positionStrength[pos].pct)}
                   </td>
                   {grid.map((inn, innIdx) => {
                     const pid = inn[pos];
