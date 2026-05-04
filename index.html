@@ -2554,6 +2554,27 @@ function App() {
   );
   const isPlayed = !!currentScheduleEntry?.played;
 
+  // Chronologically-ordered games with saved lineups. Powers the prev/next
+  // arrows at the top of the Lineup Editor so the coach can step through
+  // the schedule without bouncing back to the calendar tab between games.
+  const gamesWithLineups = useMemo(() => {
+    return schedule
+      .filter(g => g && g.kind === "game" && g.lineup && Array.isArray(g.lineup.grid))
+      .slice()
+      .sort((a, b) => {
+        if (a.date !== b.date) return a.date < b.date ? -1 : 1;
+        const ta = a.time || "";
+        const tb = b.time || "";
+        return ta < tb ? -1 : ta > tb ? 1 : 0;
+      });
+  }, [schedule]);
+  const navIndex = useMemo(
+    () => currentScheduleId ? gamesWithLineups.findIndex(g => g.id === currentScheduleId) : -1,
+    [gamesWithLineups, currentScheduleId]
+  );
+  const prevGame = navIndex > 0 ? gamesWithLineups[navIndex - 1] : null;
+  const nextGame = (navIndex >= 0 && navIndex < gamesWithLineups.length - 1) ? gamesWithLineups[navIndex + 1] : null;
+
   // Save handler for the "Log pitches" modal: replaces this game's pitch logs
   // and flips the entry's played flag so the calendar can mark it.
   const handleSavePitchLog = (entries) => {
@@ -2721,7 +2742,10 @@ function App() {
             const w = validateLineup(editableGrid, computed.posHistory, availablePlayers, gameInnings, benchTiers);
             setWarnings(w);
           }}
-          onBack={() => setTab("setup")} />}
+          onBack={() => setTab("setup")}
+          prevGame={prevGame}
+          nextGame={nextGame}
+          onNavigateToGame={handleOpenScheduleEntry} />}
       </div>
       <TeamDataModal
         open={teamDataModalOpen}
@@ -3011,8 +3035,9 @@ function RosterTab({ roster, setRoster, schedule = [], pitchLogs = [], setPitchL
   const [usageEnd,   setUsageEnd]   = useState("");
   // When true, future games with saved lineups are folded into the heatmap
   // alongside played games — useful for seeing how a season-wide plan
-  // distributes innings across players.
-  const [includeProjected, setIncludeProjected] = useState(false);
+  // distributes innings across players. Defaults to true since the
+  // season-planning view is the main reason to look at this report.
+  const [includeProjected, setIncludeProjected] = useState(true);
 
   // Played games (date < today) that have a saved lineup AND fall within the
   // chosen date range. Empty range bounds = no limit on that side.
@@ -3044,8 +3069,10 @@ function RosterTab({ roster, setRoster, schedule = [], pitchLogs = [], setPitchL
   );
   // When true, every cell shows innings-per-game (count / N games included)
   // instead of the raw inning count. Heatmap colors stay tied to the raw
-  // counts so the visual ranking doesn't shift between modes.
-  const [showAverage, setShowAverage] = useState(false);
+  // counts so the visual ranking doesn't shift between modes. Defaults to
+  // true — averages are easier to scan against the bench-tier targets
+  // (Regular = 2 BN/game, etc.) than raw seasonal totals.
+  const [showAverage, setShowAverage] = useState(true);
 
   // Inning counts per (player, position), plus a synthetic BN bucket for
   // bench innings. BN is tracked separately so it can render without a
@@ -3308,8 +3335,9 @@ function ArmCareTab({ roster, pitchLogs, setPitchLogs, canEdit = true, schedule 
   // When true, planned pitches from future saved lineups are folded into the
   // 7d/14d/30d totals and the Status calculation. Lets the coach scrub the
   // as-of date forward and see what each pitcher's situation will look like
-  // under the current plan.
-  const [includeProjected, setIncludeProjected] = useState(false);
+  // under the current plan. Defaults to true so the season-planning view is
+  // the default — toggle off to see only actual logged outings.
+  const [includeProjected, setIncludeProjected] = useState(true);
   const pitchers = roster.filter(p => p.positionMap?.P);
 
   // Synthesize "projected" pitch entries from saved future-game lineups.
@@ -3801,7 +3829,7 @@ function SetupTab({ roster, setRoster, availablePlayers, absentIds, setAbsentIds
 // ══════════════════════════════════════════════════
 // LINEUP TAB (with swap, finalize, PNG, color summary)
 // ══════════════════════════════════════════════════
-function LineupTab({ grid, setGrid, posHistory, benchCount, roster, fullRoster, warnings, innings, pitcherAssignments, catcherAssignments, benchTiers, gameMeta, isFinalized, setIsFinalized, generationId, isLinkedToSchedule = false, isPlayed = false, pitchLogsForGame = [], onSavePitchLog = () => {}, onDeleteLineup = () => {}, onRevalidate, onBack, canEdit = true }) {
+function LineupTab({ grid, setGrid, posHistory, benchCount, roster, fullRoster, warnings, innings, pitcherAssignments, catcherAssignments, benchTiers, gameMeta, isFinalized, setIsFinalized, generationId, isLinkedToSchedule = false, isPlayed = false, pitchLogsForGame = [], onSavePitchLog = () => {}, onDeleteLineup = () => {}, onRevalidate, onBack, canEdit = true, prevGame = null, nextGame = null, onNavigateToGame = () => {} }) {
   const isMobile = useIsMobile();
   const [pitchLogModalOpen, setPitchLogModalOpen] = useState(false);
   const [confirmDeleteLineup, setConfirmDeleteLineup] = useState(false);
@@ -4281,8 +4309,53 @@ function LineupTab({ grid, setGrid, posHistory, benchCount, roster, fullRoster, 
   ].filter(Boolean);
   const showGameHeader = !!(gameMeta?.opponent || gameMeta?.date);
 
+  // Short label for the prev/next nav buttons. Returns "May 17 vs Eagles"
+  // (or "@ Eagles" for away). Falls back to just the date if the entry has
+  // no opponent set.
+  const formatNavLabel = (entry) => {
+    if (!entry) return "";
+    let datePart = entry.date || "";
+    try {
+      if (entry.date) {
+        const d = new Date(entry.date + "T12:00:00");
+        datePart = d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+      }
+    } catch {}
+    const oppPart = entry.opponent ? `${entry.homeAway === "away" ? "@" : "vs"} ${entry.opponent}` : "";
+    return oppPart ? `${datePart} · ${oppPart}` : datePart;
+  };
+
   return (
     <div>
+      {/* Prev/next nav between games with saved lineups. Hidden when this
+          lineup isn't tied to a schedule entry, or when there's only one
+          game in the season so there's nothing to navigate to. */}
+      {isLinkedToSchedule && (prevGame || nextGame) && (
+        <div style={{ marginBottom: 10, display: "flex", alignItems: "center", gap: 8 }}>
+          <button onClick={() => prevGame && onNavigateToGame(prevGame)} disabled={!prevGame}
+            title={prevGame ? `Previous game: ${formatNavLabel(prevGame)}` : "This is the earliest game with a saved lineup"}
+            style={{
+              ...miniChipStyle, fontSize: 12, padding: "5px 12px", fontWeight: 500,
+              opacity: prevGame ? 1 : 0.35, cursor: prevGame ? "pointer" : "default",
+              flex: "0 1 auto", minWidth: 0, maxWidth: "45%",
+              overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+            }}>
+            {"← "}{prevGame ? formatNavLabel(prevGame) : "—"}
+          </button>
+          <div style={{ flex: 1 }} />
+          <button onClick={() => nextGame && onNavigateToGame(nextGame)} disabled={!nextGame}
+            title={nextGame ? `Next game: ${formatNavLabel(nextGame)}` : "This is the latest game with a saved lineup"}
+            style={{
+              ...miniChipStyle, fontSize: 12, padding: "5px 12px", fontWeight: 500,
+              opacity: nextGame ? 1 : 0.35, cursor: nextGame ? "pointer" : "default",
+              flex: "0 1 auto", minWidth: 0, maxWidth: "45%",
+              overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+            }}>
+            {nextGame ? formatNavLabel(nextGame) : "—"}{" →"}
+          </button>
+        </div>
+      )}
+
       {/* Game header — opponent + date + time + type pinned at the top so the
           coach knows which game they're editing, especially when bouncing
           between several entries from the schedule in one session. */}
