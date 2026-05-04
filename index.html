@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-  <title>Lineup Builder - Jacks 2026</title>
+  <title>Dugout — 11U OBA</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
@@ -349,6 +349,97 @@ function save(k, v) {
   try { localStorage.setItem(k, JSON.stringify(v)); } catch {}
   queueCloudWrite(k, v);
 }
+
+// ══════════════════════════════════════════════════
+// TEAM DATA PUBLISH / SYNC
+// "Publish via the repo" mechanism — no auth, no backend. The head coach
+// exports a JSON snapshot of their localStorage, drops it into the repo
+// as `team-data.json`, and pushes. Other devices loading the site fetch
+// that file; if its `publishedAt` is newer than what the device has
+// locally, a banner offers to apply it (overwriting localStorage).
+// ══════════════════════════════════════════════════
+const TEAM_DATA_URL = "./team-data.json";
+const PUBLISHED_AT_KEY = "dugout_publishedAt";
+const SYNC_KEYS = {
+  roster:     "dugout_roster",
+  schedule:   "dugout_schedule",
+  pitchLogs:  "dugout_pitchLogs",
+  benchTiers: "dugout_benchTiers",
+};
+
+function buildTeamDataExport() {
+  const out = { publishedAt: Date.now() };
+  for (const [short, lsKey] of Object.entries(SYNC_KEYS)) {
+    let v = null;
+    try { v = JSON.parse(localStorage.getItem(lsKey) || "null"); } catch {}
+    out[short] = v;
+  }
+  return out;
+}
+
+function downloadTeamData() {
+  const data = buildTeamDataExport();
+  const json = JSON.stringify(data, null, 2);
+  const blob = new Blob([json], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "team-data.json";
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+  return data.publishedAt;
+}
+
+function applyTeamData(data) {
+  if (!data || typeof data !== "object") return false;
+  if (!Array.isArray(data.roster)) return false;
+  let touched = false;
+  for (const [short, lsKey] of Object.entries(SYNC_KEYS)) {
+    const v = data[short];
+    if (v == null) continue;
+    if (Array.isArray(v) || typeof v === "object") {
+      try { localStorage.setItem(lsKey, JSON.stringify(v)); touched = true; } catch {}
+    }
+  }
+  if (touched) {
+    const pa = typeof data.publishedAt === "number" ? data.publishedAt : Date.now();
+    try { localStorage.setItem(PUBLISHED_AT_KEY, String(pa)); } catch {}
+  }
+  return touched;
+}
+
+async function fetchTeamDataFromServer() {
+  try {
+    const res = await fetch(TEAM_DATA_URL, { cache: "no-store" });
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (typeof data?.publishedAt !== "number") return null;
+    return data;
+  } catch { return null; }
+}
+
+function getLocalPublishedAt() {
+  try {
+    const v = localStorage.getItem(PUBLISHED_AT_KEY);
+    return v ? (parseInt(v, 10) || 0) : 0;
+  } catch { return 0; }
+}
+function setLocalPublishedAt(ts) {
+  try { localStorage.setItem(PUBLISHED_AT_KEY, String(ts)); } catch {}
+}
+
+function formatPublishedAt(ts) {
+  if (!ts) return "never";
+  try {
+    return new Date(ts).toLocaleString(undefined, {
+      month: "short", day: "numeric", year: "numeric",
+      hour: "numeric", minute: "2-digit",
+    });
+  } catch { return String(ts); }
+}
+
 // positionMap values may be bare tiers ("preferred") or tier-with-rank ("secondary:2").
 // Rank breaks ties within a tier (1 = top). Missing rank defaults to 1.
 function playerTier(player, pos) {
@@ -1902,6 +1993,72 @@ function LoginScreen() {
 }
 
 // ══════════════════════════════════════════════════
+// TEAM DATA MODAL
+// Settings sheet for exporting / importing / re-syncing the team-data.json
+// snapshot. Opened from the gear icon in the header.
+// ══════════════════════════════════════════════════
+function TeamDataModal({ open, onClose, onExport, onImportFile, onSyncFromServer, localPublishedAt, serverPublishedAt }) {
+  const fileInputRef = useRef(null);
+  if (!open) return null;
+
+  const onPickFile = (e) => {
+    const f = e.target.files?.[0];
+    if (f) onImportFile(f);
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  };
+
+  const sectionStyle = { borderTop: `1px solid ${C.borderLight}`, paddingTop: 14, marginTop: 14 };
+  const labelStyle   = { fontSize: 12, fontWeight: 600, color: C.textMuted, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 6 };
+  const descStyle    = { fontSize: 12, color: C.textMuted, marginBottom: 10, lineHeight: 1.4 };
+  const btnStyle     = { background: C.surface, border: `1px solid ${C.border}`, color: C.text, padding: "8px 14px", borderRadius: 6, fontFamily: FONT, fontSize: 13, fontWeight: 500, cursor: "pointer" };
+  const primaryBtn   = { ...btnStyle, background: C.accent, borderColor: C.accent, color: "#fff", fontWeight: 600 };
+
+  return (
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.4)", display: "flex", alignItems: "flex-start", justifyContent: "center", padding: "30px 16px 20px", zIndex: 1000 }}>
+      <div onClick={(e) => e.stopPropagation()} style={{ background: C.surface, color: C.text, borderRadius: 8, padding: 20, maxWidth: 560, width: "100%", maxHeight: "calc(100vh - 60px)", overflowY: "auto", boxShadow: "0 8px 32px rgba(0,0,0,0.2)" }}>
+        <div style={{ display: "flex", alignItems: "center", marginBottom: 14 }}>
+          <span style={{ fontFamily: DISPLAY, fontSize: 18, fontWeight: 700, color: C.text }}>Team data</span>
+          <button onClick={onClose} title="Close" style={{ marginLeft: "auto", background: "transparent", border: "none", color: C.textMuted, cursor: "pointer", fontSize: 20, lineHeight: 1, padding: "4px 8px" }}>{"×"}</button>
+        </div>
+
+        <div style={{ fontSize: 12, color: C.textMuted, lineHeight: 1.6 }}>
+          <div>Last applied here: <strong style={{ color: C.text }}>{formatPublishedAt(localPublishedAt)}</strong></div>
+          <div>Latest on server: <strong style={{ color: C.text }}>{serverPublishedAt ? formatPublishedAt(serverPublishedAt) : "no team-data.json found"}</strong></div>
+        </div>
+
+        <div style={sectionStyle}>
+          <div style={labelStyle}>Export</div>
+          <div style={descStyle}>Download a JSON snapshot of your current team data (roster, schedule, lineups, pitch logs, bench tiers).</div>
+          <button onClick={onExport} style={primaryBtn}>Download team-data.json</button>
+        </div>
+
+        <div style={sectionStyle}>
+          <div style={labelStyle}>Import</div>
+          <div style={descStyle}>Replace your view with a JSON file (e.g. one a coach exported and sent you). Local edits will be overwritten.</div>
+          <input ref={fileInputRef} type="file" accept="application/json,.json" onChange={onPickFile} style={{ display: "none" }} />
+          <button onClick={() => fileInputRef.current?.click()} style={btnStyle}>{"Choose file…"}</button>
+        </div>
+
+        <div style={sectionStyle}>
+          <div style={labelStyle}>Sync from server</div>
+          <div style={descStyle}>Reload from the latest team-data.json deployed on this site. Use this if you skipped the banner earlier.</div>
+          <button onClick={onSyncFromServer} style={btnStyle}>Sync now</button>
+        </div>
+
+        <div style={{ ...sectionStyle, fontSize: 11, color: C.textMuted, lineHeight: 1.5 }}>
+          <div style={{ fontWeight: 600, color: C.textMuted, marginBottom: 4 }}>Publishing workflow</div>
+          <ol style={{ paddingLeft: 18, margin: 0 }}>
+            <li>Make changes here, then click <strong>Download team-data.json</strong>.</li>
+            <li>Upload that file to the GitHub repo (overwrite the existing team-data.json).</li>
+            <li>Push. Other devices loading the site see a banner offering to apply the new data.</li>
+          </ol>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════
 // APP
 // ══════════════════════════════════════════════════
 function App() {
@@ -1931,6 +2088,33 @@ function App() {
   // True when this device's localStorage holds data the cloud doesn't have.
   // Drives the import-to-cloud banner above the main content.
   const [showImportBanner, setShowImportBanner] = useState(false);
+
+  // Team data publish/sync. On mount we fetch ./team-data.json from the
+  // deployed origin; if its publishedAt is newer than what's stored locally,
+  // the banner offers to apply it (overwriting localStorage with the snapshot).
+  const [serverTeamData, setServerTeamData] = useState(null);
+  const [showServerBanner, setShowServerBanner] = useState(false);
+  const [teamDataModalOpen, setTeamDataModalOpen] = useState(false);
+  // Local "last applied" timestamp, mirrored from localStorage. Stored as
+  // React state so the modal's displayed time updates after Export/Skip
+  // without needing a reload.
+  const [localPublishedAt, setLocalPublishedAtState] = useState(() => getLocalPublishedAt());
+  const stampLocalPublishedAt = (ts) => {
+    setLocalPublishedAt(ts);
+    setLocalPublishedAtState(ts);
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchTeamDataFromServer().then(data => {
+      if (cancelled || !data) return;
+      setServerTeamData(data);
+      if (data.publishedAt > getLocalPublishedAt()) {
+        setShowServerBanner(true);
+      }
+    });
+    return () => { cancelled = true; };
+  }, []);
 
   useEffect(() => {
     if (!REQUIRE_AUTH) {
@@ -2068,6 +2252,52 @@ function App() {
       if (v != null) save(k, v);
     }
     setShowImportBanner(false);
+  };
+
+  // Apply the team-data.json that the server banner advertised: overwrite
+  // localStorage with the snapshot and reload so React re-reads everything
+  // from a clean slate. Reload is the simplest way to avoid having to
+  // mirror the snapshot into every useState above.
+  const applyServerTeamData = () => {
+    if (!serverTeamData) return;
+    if (applyTeamData(serverTeamData)) window.location.reload();
+    else alert("Couldn't apply server team data — it's missing a valid roster.");
+  };
+  // Suppress the banner for THIS published version. Bumps local publishedAt
+  // so we don't re-prompt on the next refresh until something newer ships.
+  // The user's local data is left untouched.
+  const skipServerTeamData = () => {
+    if (serverTeamData?.publishedAt) stampLocalPublishedAt(serverTeamData.publishedAt);
+    setShowServerBanner(false);
+  };
+  // Export: download a JSON snapshot, and stamp local publishedAt so the
+  // head coach's next page load doesn't see a banner pointing at their own
+  // export.
+  const handleExportTeamData = () => {
+    const ts = downloadTeamData();
+    stampLocalPublishedAt(ts);
+  };
+  const handleImportFile = (file) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      let data;
+      try { data = JSON.parse(e.target.result); }
+      catch { alert("Couldn't parse this file as JSON."); return; }
+      if (!data || !Array.isArray(data.roster)) {
+        alert("This file doesn't look like a Dugout team-data export.");
+        return;
+      }
+      if (!confirm("Replace your current team data with this file? Local edits will be overwritten.")) return;
+      if (applyTeamData(data)) window.location.reload();
+    };
+    reader.readAsText(file);
+  };
+  const handleSyncFromServer = async () => {
+    const data = await fetchTeamDataFromServer();
+    if (!data) { alert("No team-data.json found on the server."); return; }
+    if (!Array.isArray(data.roster)) { alert("Server team-data.json has no roster yet — nothing to apply."); return; }
+    if (!confirm(`Replace your current team data with the latest published version (${formatPublishedAt(data.publishedAt)})? Local edits will be overwritten.`)) return;
+    if (applyTeamData(data)) window.location.reload();
   };
 
   // Transient: id of the schedule entry the user is currently editing. Set
@@ -2384,6 +2614,11 @@ function App() {
             border: `1px solid ${C.border}`, cursor: "pointer",
             padding: "4px 8px", borderRadius: 4, lineHeight: 1, fontFamily: FONT,
           }}>{theme === "dark" ? "☀" : "☾"}</button>
+          <button onClick={() => setTeamDataModalOpen(true)} title="Team data (export, import, sync)" style={{
+            fontSize: 14, color: C.textMuted, background: "transparent",
+            border: `1px solid ${C.border}`, cursor: "pointer",
+            padding: "4px 8px", borderRadius: 4, lineHeight: 1, fontFamily: FONT,
+          }}>{"⚙"}</button>
           {session ? (
             <React.Fragment>
               <span style={{ fontSize: 11, color: C.textMuted, background: C.surfaceAlt, padding: "4px 8px", borderRadius: 4, border: `1px solid ${C.border}`, maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
@@ -2395,7 +2630,7 @@ function App() {
             </React.Fragment>
           ) : (
             <span title="Auth gate disabled in source — flip REQUIRE_AUTH back to true to require login" style={{ fontSize: 11, color: C.orange, background: C.orangeLight, padding: "4px 8px", borderRadius: 4, border: `1px solid ${C.orange}`, fontWeight: 600 }}>
-              Beta v2.6
+              Live beta
             </span>
           )}
         </div>
@@ -2415,6 +2650,17 @@ function App() {
         ))}
       </div>
       <div style={{ maxWidth: 920, margin: "0 auto", padding: "20px 16px" }}>
+        {showServerBanner && serverTeamData && (
+          <div style={{ background: C.blueLight, border: `1px solid ${C.blue}`, borderRadius: 8, padding: "12px 16px", marginBottom: 16, display: "flex", alignItems: "center", gap: 12, fontSize: 13, color: C.text, flexWrap: "wrap" }}>
+            <div style={{ flex: "1 1 240px", lineHeight: 1.4 }}>
+              <strong>New team data published.</strong> Latest version is from {formatPublishedAt(serverTeamData.publishedAt)}. Apply it to load the team's current roster, schedule, and lineups. Local edits will be overwritten.
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button onClick={skipServerTeamData} style={{ background: C.surface, border: `1px solid ${C.border}`, color: C.text, padding: "6px 12px", borderRadius: 6, fontFamily: FONT, fontSize: 12, fontWeight: 500, cursor: "pointer" }}>Skip</button>
+              <button onClick={applyServerTeamData} style={{ background: C.accent, border: `1px solid ${C.accent}`, color: "#fff", padding: "6px 12px", borderRadius: 6, fontFamily: FONT, fontSize: 12, fontWeight: 600, cursor: "pointer" }}>Apply</button>
+            </div>
+          </div>
+        )}
         {showImportBanner && (
           <div style={{ background: C.blueLight, border: `1px solid ${C.blue}`, borderRadius: 8, padding: "12px 16px", marginBottom: 16, display: "flex", alignItems: "center", gap: 12, fontSize: 13, color: C.text, flexWrap: "wrap" }}>
             <div style={{ flex: "1 1 240px", lineHeight: 1.4 }}>
@@ -2455,6 +2701,15 @@ function App() {
           }}
           onBack={() => setTab("setup")} />}
       </div>
+      <TeamDataModal
+        open={teamDataModalOpen}
+        onClose={() => setTeamDataModalOpen(false)}
+        onExport={handleExportTeamData}
+        onImportFile={handleImportFile}
+        onSyncFromServer={handleSyncFromServer}
+        localPublishedAt={localPublishedAt}
+        serverPublishedAt={serverTeamData?.publishedAt}
+      />
     </div>
   );
 }
@@ -2732,11 +2987,6 @@ function RosterTab({ roster, setRoster, schedule = [], pitchLogs = [], setPitchL
   // side). Both bounds are inclusive ISO date strings (YYYY-MM-DD).
   const [usageStart, setUsageStart] = useState("");
   const [usageEnd,   setUsageEnd]   = useState("");
-  // "total" = raw inning counts; "perGame" = avg innings per game the player
-  // actually appeared in (any position or bench, excluding total no-shows).
-  const [usageMode, setUsageMode] = useState("total");
-  // Sort: column id ("number", "name", or one of USAGE_COLS) + direction.
-  const [usageSort, setUsageSort] = useState({ col: "number", dir: "asc" });
 
   // Past games (strictly before wall-clock today) that have a saved lineup
   // AND fall within the chosen date range. Empty range bounds = no limit on
@@ -2752,111 +3002,32 @@ function RosterTab({ roster, setRoster, schedule = [], pitchLogs = [], setPitchL
     });
   }, [schedule, usageStart, usageEnd]);
 
-  // Columns shown in the usage chart: pitching, all field positions, then bench.
-  const USAGE_COLS = useMemo(() => [...ALL_POS, "BN"], []);
-
-  // Inning counts per (player, position) — including BN (bench) — plus
-  // games-played per player for the per-game-average mode. A player counts
-  // as having played in a game if they appear at any position OR on the
-  // bench in any inning of that game.
-  const { usageByPlayer, gamesByPlayer } = useMemo(() => {
-    const usage = {};
-    const games = {};
-    roster.forEach(p => { usage[p.id] = {}; games[p.id] = 0; });
+  // Inning counts per (player, position).
+  const usageByPlayer = useMemo(() => {
+    const result = {};
+    roster.forEach(p => { result[p.id] = {}; });
     includedGames.forEach(g => {
-      const seen = new Set();
       g.lineup.grid.forEach(inn => {
         ALL_POS.forEach(pos => {
           const pid = inn[pos];
-          if (pid && usage[pid]) {
-            usage[pid][pos] = (usage[pid][pos] || 0) + 1;
-            seen.add(pid);
-          }
-        });
-        (inn.BN || []).forEach(pid => {
-          if (usage[pid]) {
-            usage[pid].BN = (usage[pid].BN || 0) + 1;
-            seen.add(pid);
-          }
+          if (pid && result[pid]) result[pid][pos] = (result[pid][pos] || 0) + 1;
         });
       });
-      seen.forEach(pid => { games[pid] = (games[pid] || 0) + 1; });
     });
-    return { usageByPlayer: usage, gamesByPlayer: games };
+    return result;
   }, [roster, includedGames]);
 
-  // Value shown in a cell, respecting the Total / Per-Game toggle.
-  const cellValue = (pid, col) => {
-    const raw = (usageByPlayer[pid] || {})[col] || 0;
-    if (raw === 0) return 0;
-    if (usageMode === "total") return raw;
-    const gp = gamesByPlayer[pid] || 0;
-    return gp > 0 ? raw / gp : 0;
-  };
-  const formatCell = v => {
-    if (!v) return null;
-    return usageMode === "total" ? String(Math.round(v)) : v.toFixed(1);
-  };
-
-  // Heatmap range across whatever the current mode displays.
+  // Usage range for the heatmap colors below. Computed across all (player,
+  // position) cells with a non-zero count.
   const usageRange = useMemo(() => {
     let min = Infinity, max = 0;
-    roster.forEach(p => {
-      USAGE_COLS.forEach(col => {
-        const v = cellValue(p.id, col);
-        if (v > 0) { if (v < min) min = v; if (v > max) max = v; }
+    Object.values(usageByPlayer).forEach(byPos => {
+      Object.values(byPos).forEach(n => {
+        if (n > 0) { if (n < min) min = n; if (n > max) max = n; }
       });
     });
     return { min: min === Infinity ? 0 : min, max };
-  }, [roster, usageByPlayer, gamesByPlayer, usageMode, USAGE_COLS]);
-
-  // Roster ordered by the active sort column / direction.
-  const sortedUsageRoster = useMemo(() => {
-    const rows = [...roster];
-    const dir = usageSort.dir === "desc" ? -1 : 1;
-    if (usageSort.col === "number") {
-      rows.sort((a, b) => {
-        const na = parseInt(a.number, 10);
-        const nb = parseInt(b.number, 10);
-        if (Number.isNaN(na) && Number.isNaN(nb)) return 0;
-        if (Number.isNaN(na)) return 1;
-        if (Number.isNaN(nb)) return -1;
-        return (na - nb) * dir;
-      });
-    } else if (usageSort.col === "name") {
-      rows.sort((a, b) => (a.name || "").localeCompare(b.name || "") * dir);
-    } else {
-      rows.sort((a, b) => {
-        const va = cellValue(a.id, usageSort.col);
-        const vb = cellValue(b.id, usageSort.col);
-        if (va !== vb) return (va - vb) * dir;
-        // Tiebreak by jersey number ascending so order stays stable.
-        const na = parseInt(a.number, 10);
-        const nb = parseInt(b.number, 10);
-        if (Number.isNaN(na) && Number.isNaN(nb)) return 0;
-        if (Number.isNaN(na)) return 1;
-        if (Number.isNaN(nb)) return -1;
-        return na - nb;
-      });
-    }
-    return rows;
-  }, [roster, usageSort, usageByPlayer, gamesByPlayer, usageMode]);
-
-  const handleUsageSort = (col) => {
-    setUsageSort(prev => {
-      if (prev.col === col) return { col, dir: prev.dir === "desc" ? "asc" : "desc" };
-      // Default: text columns ascending, numeric columns descending (hi→lo).
-      return { col, dir: (col === "number" || col === "name") ? "asc" : "desc" };
-    });
-  };
-  const sortArrow = (col) => {
-    if (usageSort.col !== col) return null;
-    return (
-      <span style={{ marginLeft: 2, color: C.accent, fontSize: 9 }}>
-        {usageSort.dir === "desc" ? "▼" : "▲"}
-      </span>
-    );
-  };
+  }, [usageByPlayer]);
 
   // Conditional-format gradient for the Usage Report cells:
   //   lowest non-zero count → cool light blue
@@ -2924,25 +3095,6 @@ function RosterTab({ roster, setRoster, schedule = [], pitchLogs = [], setPitchL
             <button onClick={() => { setUsageStart(""); setUsageEnd(""); }}
               style={{ ...miniChipStyle, fontSize: 11, padding: "3px 10px" }}>Whole season</button>
           )}
-          <span style={{ fontSize: 12, color: C.textMuted, fontWeight: 500, marginLeft: 12 }}>Show:</span>
-          <div style={{ display: "inline-flex", gap: 4 }}>
-            {[
-              { id: "total",   label: "Total" },
-              { id: "perGame", label: "Per Game" },
-            ].map(opt => {
-              const active = usageMode === opt.id;
-              return (
-                <button key={opt.id} onClick={() => setUsageMode(opt.id)}
-                  title={opt.id === "perGame" ? "Average innings per game the player actually appeared in" : "Total innings across all included games"}
-                  style={{ ...miniChipStyle,
-                    background: active ? C.accent : C.surface,
-                    color: active ? "#fff" : C.textMuted,
-                    borderColor: active ? C.accent : C.border,
-                    fontSize: 11, padding: "3px 10px",
-                  }}>{opt.label}</button>
-              );
-            })}
-          </div>
           <span style={{ fontSize: 11, color: C.textMuted, marginLeft: "auto" }}>
             {includedGames.length} {includedGames.length === 1 ? "game" : "games"} included
           </span>
@@ -2950,40 +3102,29 @@ function RosterTab({ roster, setRoster, schedule = [], pitchLogs = [], setPitchL
         <div style={{ overflowX: "auto", borderRadius: 8, boxShadow: "0 1px 4px rgba(0,0,0,0.06)", background: C.surface }}>
           <table style={{ width: "auto", borderCollapse: "collapse", background: C.surface, borderRadius: 8 }}>
             <thead><tr>
-              <th onClick={() => handleUsageSort("number")}
-                style={{ ...thStyle, width: 36, textAlign: "center", padding: "6px 4px", cursor: "pointer", userSelect: "none" }}>
-                #{sortArrow("number")}
-              </th>
-              <th onClick={() => handleUsageSort("name")}
-                style={{ ...thStyle, textAlign: "left", width: 130, paddingLeft: 10, padding: "6px 4px 6px 10px", cursor: "pointer", userSelect: "none" }}>
-                Player{sortArrow("name")}
-              </th>
-              {USAGE_COLS.map(col => (
-                <th key={col} onClick={() => handleUsageSort(col)}
-                  style={{ ...thStyle, width: 36, padding: "6px 2px", cursor: "pointer", userSelect: "none" }}>
-                  {col}{sortArrow(col)}
-                </th>
-              ))}
+              <th style={{ ...thStyle, width: 36, textAlign: "center", padding: "6px 4px" }}>#</th>
+              <th style={{ ...thStyle, textAlign: "left", width: 130, paddingLeft: 10, padding: "6px 4px 6px 10px" }}>Player</th>
+              {ALL_POS.map(pos => <th key={pos} style={{ ...thStyle, width: 36, padding: "6px 2px" }}>{pos}</th>)}
             </tr></thead>
             <tbody>
-              {sortedUsageRoster.map((p, i) => {
+              {roster.map((p, i) => {
                 const bg = i % 2 === 0 ? C.surface : C.surfaceAlt;
+                const usage = usageByPlayer[p.id] || {};
                 return (
                   <tr key={p.id}>
                     <td style={{ ...tdStyle, background: bg, textAlign: "center", color: C.accent, fontWeight: 600, padding: "3px 2px", fontSize: 12 }}>{p.number || "—"}</td>
                     <td style={{ ...tdStyle, background: bg, fontWeight: 600, padding: "3px 2px 3px 10px", fontSize: 13 }}>{p.name}</td>
-                    {USAGE_COLS.map(col => {
-                      const value = cellValue(p.id, col);
-                      const heat = value > 0 ? heatColor(value, usageRange.min, usageRange.max) : null;
-                      const display = formatCell(value);
+                    {ALL_POS.map(pos => {
+                      const count = usage[pos] || 0;
+                      const heat = count > 0 ? heatColor(count, usageRange.min, usageRange.max) : null;
                       return (
-                        <td key={col} style={{
+                        <td key={pos} style={{
                           ...tdStyle, textAlign: "center", padding: "3px 2px",
                           background: heat || bg,
-                          color: value > 0 ? C.text : C.textLight,
-                          fontWeight: value > 0 ? 700 : 400,
+                          color: count > 0 ? C.text : C.textLight,
+                          fontWeight: count > 0 ? 700 : 400,
                           fontSize: 12,
-                        }}>{display || "—"}</td>
+                        }}>{count > 0 ? count : "—"}</td>
                       );
                     })}
                   </tr>
