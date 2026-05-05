@@ -1,5 +1,5 @@
 {
-  "publishedAt": 1777954413663,
+  "publishedAt": 1777955721117,
   "roster": [
     {
       "id": "1",
@@ -50,7 +50,7 @@
       "name": "Owen",
       "number": "16",
       "positionMap": {
-        "P": "preferred",
+        "P": "secondary",
         "LF": "preferred",
         "RF": "secondary"
       }
@@ -64,7 +64,8 @@
         "RF": "secondary",
         "CF": "emergency",
         "C": "emergency",
-        "3B": "secondary"
+        "3B": "secondary",
+        "P": "secondary"
       }
     },
     {
@@ -84,7 +85,8 @@
       "positionMap": {
         "LF": "secondary",
         "RF": "secondary",
-        "2B": "emergency"
+        "2B": "emergency",
+        "P": "secondary"
       }
     },
     {
@@ -118,7 +120,8 @@
       "number": "88",
       "positionMap": {
         "LF": "secondary",
-        "RF": "secondary"
+        "RF": "secondary",
+        "P": "emergency"
       }
     },
     {
