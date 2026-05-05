@@ -2546,6 +2546,37 @@ function App() {
     setTab("lineup");
   };
 
+  // In-flight regenerate triggered by the Lineup Editor's EditPlanModal.
+  // Accepts the modal's draft pitchers/catchers, validates them, runs the
+  // solver, and replaces the active grid + assignments. Returns true on
+  // success so the modal knows when to close itself.
+  const handleRegenerateWithPlan = (pitchers, catchers) => {
+    if (!Array.isArray(pitchers) || !Array.isArray(catchers)) return false;
+    if (pitchers.length === 0 || catchers.length === 0) return false;
+    for (const pa of pitchers) {
+      const avail = pitcherAvailability[pa.id];
+      if (avail && !avail.available) {
+        alert(`${roster.find(p => p.id === pa.id)?.name} is unavailable — ${avail.reason}.`);
+        return false;
+      }
+    }
+    const best = multiRunSolve({
+      roster: availablePlayers, pitchers, catchers,
+      absentIds, innings: gameInnings, benchTiers, pins: [], attempts: 25,
+    });
+    if (!best) {
+      alert("Couldn't produce any valid lineup. Check that pitchers/catchers are set and enough players are available.");
+      return false;
+    }
+    setPitcherAssignments(pitchers);
+    setCatcherAssignments(catchers);
+    setEditableGrid(JSON.parse(JSON.stringify(best.result.grid)));
+    setWarnings(best.scored.warnings);
+    setIsFinalized(false);
+    setGenerationId(g => g + 1);
+    return true;
+  };
+
   // Re-validate when grid changes
   useEffect(() => {
     if (editableGrid) {
@@ -2814,23 +2845,22 @@ function App() {
             const w = validateLineup(editableGrid, computed.posHistory, availablePlayers, gameInnings, benchTiers);
             setWarnings(w);
           }}
-          onBack={() => {
-            // Schedule-linked editor → return to the Lineups list (clear the
-            // active edit so LineupTab's `if (!grid)` branch fires). One-off
-            // lineups (no schedule entry) fall back to the Setup tab where
-            // they were generated, since the list won't have an entry for them.
-            if (currentScheduleId) {
-              setEditableGrid(null);
-              setCurrentScheduleId(null);
-              setWarnings([]);
-            } else {
-              setTab("setup");
-            }
+          onBack={() => setTab("setup")}
+          onReturnToList={() => {
+            // Clears the active edit so LineupTab's `if (!grid)` branch
+            // fires and renders the Lineups list. The auto-save mirror
+            // effect has already written the lineup back to its schedule
+            // entry, so nothing is lost here.
+            setEditableGrid(null);
+            setCurrentScheduleId(null);
+            setWarnings([]);
           }}
           prevGame={prevGame}
           nextGame={nextGame}
           onNavigateToGame={handleOpenScheduleEntry}
-          schedule={schedule} />}
+          schedule={schedule}
+          pitcherAvailability={pitcherAvailability}
+          onRegenerateWithPlan={handleRegenerateWithPlan} />}
       </div>
       <TeamDataModal
         open={teamDataModalOpen}
@@ -3639,6 +3669,323 @@ function ArmCareTab({ roster, pitchLogs, setPitchLogs, canEdit = true, schedule 
 }
 
 // ══════════════════════════════════════════════════
+// PITCHING PLAN
+// Shared between SetupTab (full game-build flow) and the EditPlanModal
+// (in-flight tweaks from the Lineup Editor). Owns the drag-to-reorder
+// state internally; consumers just pass the assignments + a setter.
+// ══════════════════════════════════════════════════
+function PitchingPlan({ roster, pitcherAssignments, setPitcherAssignments, pitcherAvailability, pitchEligible, gameInnings, defaultOpen = true }) {
+  const isMobile = useIsMobile();
+  const [dragPitcherIdx, setDragPitcherIdx] = useState(null);
+  const totalInnings = pitcherAssignments.reduce((s, p) => s + (p.innings || 0), 0);
+  // Touch devices: HTML5 drag-and-drop is broken on iOS Safari and laggy
+  // on Android Chrome (long-press required). Skip it on mobile and rely on
+  // the ↑/↓ arrow buttons, which we make significantly larger below so the
+  // tap targets feel right under a thumb.
+  const arrowBtnStyle = {
+    ...miniChipStyle,
+    padding: isMobile ? "8px 14px" : "3px 8px",
+    fontSize: isMobile ? 16 : 12,
+    minWidth: isMobile ? 44 : 0,
+    minHeight: isMobile ? 36 : 0,
+    lineHeight: 1,
+  };
+  const removeBtnStyle = {
+    ...miniChipStyle, color: C.red, borderColor: C.red,
+    padding: isMobile ? "8px 14px" : undefined,
+    fontSize: isMobile ? 16 : undefined,
+    minWidth: isMobile ? 44 : 0,
+    minHeight: isMobile ? 36 : 0,
+    lineHeight: 1,
+  };
+
+  const addPitcher = (id) => { if (!pitcherAssignments.some(p => p.id === id)) setPitcherAssignments(prev => [...prev, { id, innings: 2, budget: 54 }]); };
+  const removePitcher = (id) => setPitcherAssignments(prev => prev.filter(p => p.id !== id));
+  const updatePitcher = (id, field, value) => setPitcherAssignments(prev => prev.map(p => p.id === id ? { ...p, [field]: value } : p));
+  const reorderPitcher = (fromIdx, toIdx) => {
+    if (fromIdx === toIdx || fromIdx == null || toIdx == null) return;
+    setPitcherAssignments(prev => {
+      if (fromIdx < 0 || fromIdx >= prev.length) return prev;
+      const clamped = Math.max(0, Math.min(toIdx, prev.length - 1));
+      const next = [...prev];
+      const [moved] = next.splice(fromIdx, 1);
+      next.splice(clamped, 0, moved);
+      return next;
+    });
+  };
+
+  return (
+    <Section title={`Pitching Plan (${totalInnings}/${gameInnings} inn)`} defaultOpen={defaultOpen} alert={totalInnings < gameInnings ? `Need ${gameInnings - totalInnings} more innings` : null} success={totalInnings >= gameInnings}>
+      {pitcherAssignments.map((pa, idx) => {
+        const player = roster.find(p => p.id === pa.id);
+        const avail = pitcherAvailability ? pitcherAvailability[pa.id] : null;
+        const isDragSource = dragPitcherIdx === idx;
+        // Drag attributes only attach on non-mobile; phones use the arrows.
+        const dragAttrs = isMobile ? {} : {
+          draggable: true,
+          onDragStart: (e) => { setDragPitcherIdx(idx); try { e.dataTransfer.effectAllowed = "move"; } catch {} },
+          onDragOver: (e) => { if (dragPitcherIdx !== null) e.preventDefault(); },
+          onDrop: (e) => { e.preventDefault(); if (dragPitcherIdx !== null && dragPitcherIdx !== idx) reorderPitcher(dragPitcherIdx, idx); setDragPitcherIdx(null); },
+          onDragEnd: () => setDragPitcherIdx(null),
+        };
+        return (
+          <div
+            key={pa.id}
+            {...dragAttrs}
+            title={isMobile ? undefined : "Drag to reorder, or use the arrows on the right"}
+            style={{
+              display: "flex", alignItems: "center", gap: 10,
+              padding: "10px 0", borderBottom: `1px solid ${C.borderLight}`,
+              flexWrap: "wrap", cursor: isMobile ? "default" : "grab",
+              opacity: isDragSource ? 0.4 : 1,
+              background: isDragSource ? C.surfaceAlt : "transparent",
+              transition: "opacity 0.1s, background 0.1s",
+            }}
+          >
+            <span style={{ color: C.accent, fontWeight: 700, width: 22, textAlign: "center", fontSize: 14, userSelect: "none" }}>{idx + 1}</span>
+            <span style={{ fontWeight: 600, minWidth: 80, fontSize: 14 }}>{player?.name}</span>
+            <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
+              <label style={{ fontSize: 12, color: C.textMuted }}>Inn:</label>
+              {[1,2,3,4,5,6,7].map(n => <button key={n} onClick={() => updatePitcher(pa.id, "innings", n)} style={{ ...miniChipStyle, background: pa.innings === n ? C.accent : C.surface, color: pa.innings === n ? "#fff" : C.textMuted, borderColor: pa.innings === n ? C.accent : C.border }}>{n}</button>)}
+            </div>
+            <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
+              <label style={{ fontSize: 12, color: C.textMuted }}>Budget:</label>
+              {ARM_CARE.budgetOptions.map(b => <button key={b} onClick={() => updatePitcher(pa.id, "budget", b)} style={{ ...miniChipStyle, background: pa.budget === b ? C.blue : C.surface, color: pa.budget === b ? "#fff" : C.textMuted, borderColor: pa.budget === b ? C.blue : C.border, fontSize: 11 }}>{b}</button>)}
+            </div>
+            {avail && (
+              <span style={{
+                fontSize: 11, padding: "3px 8px", borderRadius: 12, fontWeight: 600,
+                background: !avail.available ? C.redLight : avail.hasWarnings ? C.orangeLight : C.greenLight,
+                color:      !avail.available ? C.redText  : avail.hasWarnings ? C.orange      : C.greenText,
+              }}>{!avail.available ? "Unavailable" : avail.hasWarnings ? "Restricted" : "Available"}</span>
+            )}
+            <span style={{ fontSize: 11, color: C.textMuted }}>{"→"} {getRestLabel(pa.budget)} rest</span>
+            <div style={{ display: "flex", gap: isMobile ? 6 : 4, alignItems: "center", marginLeft: "auto" }}>
+              <button onClick={() => reorderPitcher(idx, idx - 1)} disabled={idx === 0} title="Move up"
+                style={{ ...arrowBtnStyle, opacity: idx === 0 ? 0.3 : 1, cursor: idx === 0 ? "default" : "pointer" }}>{"↑"}</button>
+              <button onClick={() => reorderPitcher(idx, idx + 1)} disabled={idx === pitcherAssignments.length - 1} title="Move down"
+                style={{ ...arrowBtnStyle, opacity: idx === pitcherAssignments.length - 1 ? 0.3 : 1, cursor: idx === pitcherAssignments.length - 1 ? "default" : "pointer" }}>{"↓"}</button>
+              <button onClick={() => removePitcher(pa.id)} title="Remove pitcher" style={removeBtnStyle}>&times;</button>
+            </div>
+            {avail && avail.warnings && avail.warnings.length > 0 && (
+              <div style={{ flexBasis: "100%", display: "flex", flexDirection: "column", gap: 2, marginLeft: 32, marginTop: -4 }}>
+                {avail.warnings.map((w, i) => (
+                  <span key={i} style={{ fontSize: 11, color: C.orange, fontWeight: 500 }}>
+                    <span style={{ marginRight: 4 }}>{"⚠"}</span>{w.msg}
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
+        );
+      })}
+      {(() => {
+        const unassigned = (pitchEligible || []).filter(p => !pitcherAssignments.some(pa => pa.id === p.id));
+        const available   = unassigned.filter(p => pitcherAvailability?.[p.id]?.available !== false);
+        const unavailable = unassigned.filter(p => pitcherAvailability?.[p.id]?.available === false);
+        return (
+          <React.Fragment>
+            <div style={{ marginTop: 14 }}>
+              <div style={{ fontSize: 12, color: C.textMuted, marginBottom: 8, fontWeight: 500 }}>Available arms:</div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                {available.length === 0 && (
+                  <span style={{ fontSize: 12, color: C.textLight, fontStyle: "italic" }}>None — all eligible pitchers are already assigned or resting.</span>
+                )}
+                {available.map(p => {
+                  const avail = pitcherAvailability?.[p.id];
+                  const hasWarn = !!avail?.hasWarnings;
+                  const tip = avail?.warnings?.length > 0 ? avail.warnings.map(w => w.msg).join(" · ") : avail?.reason;
+                  return <button key={p.id} onClick={() => addPitcher(p.id)} title={tip || ""} style={{
+                      ...chipStyle, padding: "6px 12px",
+                      background:  hasWarn ? C.orangeLight : C.greenLight,
+                      borderColor: hasWarn ? C.orange      : C.green,
+                      color:       hasWarn ? C.orange      : C.greenText,
+                    }}>
+                    {hasWarn && <span style={{ marginRight: 4 }}>{"⚠"}</span>}{p.name}
+                  </button>;
+                })}
+              </div>
+            </div>
+            {unavailable.length > 0 && (
+              <div style={{ marginTop: 14 }}>
+                <div style={{ fontSize: 12, color: C.textMuted, marginBottom: 8, fontWeight: 500 }}>Unavailable:</div>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                  {unavailable.map(p => {
+                    const avail = pitcherAvailability?.[p.id];
+                    return <button key={p.id} disabled title={avail?.reason || "Unavailable"} style={{
+                        ...chipStyle, padding: "6px 12px",
+                        opacity: 0.5, cursor: "not-allowed",
+                        background: C.redLight, borderColor: C.red, color: C.redText,
+                      }}>
+                      {p.name}
+                    </button>;
+                  })}
+                </div>
+              </div>
+            )}
+          </React.Fragment>
+        );
+      })()}
+    </Section>
+  );
+}
+
+// ══════════════════════════════════════════════════
+// CATCHING PLAN
+// Companion to PitchingPlan. Same usage pattern: pass assignments + setter.
+// ══════════════════════════════════════════════════
+function CatchingPlan({ roster, catcherAssignments, setCatcherAssignments, catchEligible, gameInnings, defaultOpen = true }) {
+  const isMobile = useIsMobile();
+  const totalInnings = catcherAssignments.reduce((s, c) => s + (c.innings || 0), 0);
+  const removeBtnStyle = {
+    ...miniChipStyle, color: C.red, borderColor: C.red, marginLeft: "auto",
+    padding: isMobile ? "8px 14px" : undefined,
+    fontSize: isMobile ? 16 : undefined,
+    minWidth: isMobile ? 44 : 0,
+    minHeight: isMobile ? 36 : 0,
+    lineHeight: 1,
+  };
+  const addCatcher = (id) => { if (!catcherAssignments.some(c => c.id === id)) setCatcherAssignments(prev => [...prev, { id, innings: 3 }]); };
+  const removeCatcher = (id) => setCatcherAssignments(prev => prev.filter(c => c.id !== id));
+  const updateCatcher = (id, field, value) => setCatcherAssignments(prev => prev.map(c => c.id === id ? { ...c, [field]: value } : c));
+
+  return (
+    <Section title={`Catching Plan (${totalInnings}/${gameInnings} inn)`} defaultOpen={defaultOpen} alert={totalInnings < gameInnings ? `Need ${gameInnings - totalInnings} more innings` : null} success={totalInnings >= gameInnings}>
+      {catcherAssignments.map((ca, idx) => {
+        const player = roster.find(p => p.id === ca.id);
+        return (
+          <div key={ca.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 0", borderBottom: `1px solid ${C.borderLight}` }}>
+            <span style={{ color: C.accent, fontWeight: 700, width: 22, textAlign: "center", fontSize: 14 }}>{idx + 1}</span>
+            <span style={{ fontWeight: 600, minWidth: 80, fontSize: 14 }}>{player?.name}</span>
+            <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
+              <label style={{ fontSize: 12, color: C.textMuted }}>Inn:</label>
+              {[1,2,3,4,5,6].map(n => <button key={n} onClick={() => updateCatcher(ca.id, "innings", n)} style={{ ...miniChipStyle, background: ca.innings === n ? C.accent : C.surface, color: ca.innings === n ? "#fff" : C.textMuted, borderColor: ca.innings === n ? C.accent : C.border }}>{n}</button>)}
+            </div>
+            <button onClick={() => removeCatcher(ca.id)} title="Remove catcher" style={removeBtnStyle}>&times;</button>
+          </div>
+        );
+      })}
+      <div style={{ marginTop: 14 }}>
+        <div style={{ fontSize: 12, color: C.textMuted, marginBottom: 8, fontWeight: 500 }}>Available catchers:</div>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+          {(catchEligible || [])
+            .filter(p => !catcherAssignments.some(ca => ca.id === p.id))
+            .slice()
+            .sort((a, b) => (TIER_SCORE[playerTier(b, "C")] || 0) - (TIER_SCORE[playerTier(a, "C")] || 0))
+            .map(p => {
+              const tier = playerTier(p, "C");
+              return <button key={p.id} onClick={() => addCatcher(p.id)} style={{ ...chipStyle, padding: "6px 12px", background: C.surface, borderColor: TIER_COLORS[tier] || C.border }}>
+                <span style={{ display: "inline-block", width: 7, height: 7, borderRadius: "50%", background: TIER_COLORS[tier] || C.textLight, marginRight: 6 }} />
+                {p.name}
+              </button>;
+          })}
+        </div>
+      </div>
+    </Section>
+  );
+}
+
+// ══════════════════════════════════════════════════
+// EDIT PLAN MODAL
+// In-flight pitching/catching tweak from the Lineup Editor. Drafts the
+// changes locally so Cancel discards cleanly, then on Save the App-level
+// state gets replaced and the lineup is regenerated from scratch.
+// ══════════════════════════════════════════════════
+function EditPlanModal({ open, onClose, roster, currentPitchers, currentCatchers, pitcherAvailability, pitchEligible, catchEligible, gameInnings, onSaveAndRegenerate }) {
+  if (!open) return null;
+  return (
+    <EditPlanModalInner
+      onClose={onClose}
+      roster={roster}
+      currentPitchers={currentPitchers}
+      currentCatchers={currentCatchers}
+      pitcherAvailability={pitcherAvailability}
+      pitchEligible={pitchEligible}
+      catchEligible={catchEligible}
+      gameInnings={gameInnings}
+      onSaveAndRegenerate={onSaveAndRegenerate}
+    />
+  );
+}
+
+function EditPlanModalInner({ onClose, roster, currentPitchers, currentCatchers, pitcherAvailability, pitchEligible, catchEligible, gameInnings, onSaveAndRegenerate }) {
+  // Drafts initialise from a deep copy so edits don't leak back to App state
+  // until Save & Regenerate fires. Using useState with the prop as the
+  // initializer means each fresh mount of the modal starts from the latest
+  // App state.
+  const [draftPitchers, setDraftPitchers] = useState(() => JSON.parse(JSON.stringify(currentPitchers || [])));
+  const [draftCatchers, setDraftCatchers] = useState(() => JSON.parse(JSON.stringify(currentCatchers || [])));
+
+  const totalP = draftPitchers.reduce((s, p) => s + (p.innings || 0), 0);
+  const totalC = draftCatchers.reduce((s, c) => s + (c.innings || 0), 0);
+  const enoughInnings = totalP >= gameInnings && totalC >= gameInnings && draftPitchers.length > 0 && draftCatchers.length > 0;
+
+  const handleSave = () => {
+    if (!enoughInnings) return;
+    onSaveAndRegenerate(draftPitchers, draftCatchers);
+  };
+
+  return (
+    <div onClick={onClose} style={{
+      position: "fixed", inset: 0, background: "rgba(0,0,0,0.45)",
+      display: "flex", alignItems: "flex-start", justifyContent: "center",
+      padding: "30px 16px 20px", zIndex: 1000,
+    }}>
+      <div onClick={(e) => e.stopPropagation()} style={{
+        background: C.surface, color: C.text, borderRadius: 8, padding: 20,
+        maxWidth: 720, width: "100%", maxHeight: "calc(100vh - 60px)", overflowY: "auto",
+        boxShadow: "0 8px 32px rgba(0,0,0,0.2)",
+      }}>
+        <div style={{ display: "flex", alignItems: "center", marginBottom: 14 }}>
+          <span style={{ fontFamily: DISPLAY, fontSize: 18, fontWeight: 700, color: C.text }}>Edit pitching &amp; catching</span>
+          <button onClick={onClose} title="Cancel" style={{
+            marginLeft: "auto", background: "transparent", border: "none",
+            color: C.textMuted, cursor: "pointer", fontSize: 20, lineHeight: 1, padding: "4px 8px",
+          }}>{"×"}</button>
+        </div>
+
+        <div style={{ fontSize: 12, color: C.textMuted, lineHeight: 1.5, marginBottom: 16, padding: "10px 12px", background: C.surfaceAlt, borderRadius: 6, border: `1px solid ${C.borderLight}` }}>
+          <strong>Save &amp; Regenerate</strong> rebuilds the position grid from these assignments. Any manual swaps you've made on the lineup will be replaced.
+        </div>
+
+        <PitchingPlan
+          roster={roster}
+          pitcherAssignments={draftPitchers}
+          setPitcherAssignments={setDraftPitchers}
+          pitcherAvailability={pitcherAvailability}
+          pitchEligible={pitchEligible}
+          gameInnings={gameInnings}
+          defaultOpen={true}
+        />
+
+        <CatchingPlan
+          roster={roster}
+          catcherAssignments={draftCatchers}
+          setCatcherAssignments={setDraftCatchers}
+          catchEligible={catchEligible}
+          gameInnings={gameInnings}
+          defaultOpen={true}
+        />
+
+        <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 18, paddingTop: 14, borderTop: `1px solid ${C.borderLight}` }}>
+          <button onClick={onClose} style={{
+            background: C.surface, border: `1px solid ${C.border}`, color: C.text,
+            padding: "10px 20px", borderRadius: 6, fontFamily: FONT, fontSize: 13, fontWeight: 500, cursor: "pointer",
+          }}>Cancel</button>
+          <button onClick={handleSave} disabled={!enoughInnings} title={enoughInnings ? "" : "Need enough innings on both pitching and catching plans"} style={{
+            background: enoughInnings ? C.accent : C.surfaceAlt,
+            border: `1px solid ${enoughInnings ? C.accent : C.border}`,
+            color: enoughInnings ? "#fff" : C.textLight,
+            padding: "10px 22px", borderRadius: 6, fontFamily: FONT, fontSize: 13, fontWeight: 600,
+            cursor: enoughInnings ? "pointer" : "not-allowed",
+          }}>Save &amp; Regenerate</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════
 // SETUP TAB (no CF restriction)
 // ══════════════════════════════════════════════════
 function SetupTab({ roster, setRoster, availablePlayers, absentIds, setAbsentIds, pitcherAssignments, setPitcherAssignments, catcherAssignments, setCatcherAssignments, benchTiers, setBenchTiers, pitcherAvailability, gameInnings, setGameInnings, gameMeta, setGameMeta, onGenerate }) {
@@ -3653,26 +4000,9 @@ function SetupTab({ roster, setRoster, availablePlayers, absentIds, setAbsentIds
   };
   const pitchEligible = availablePlayers.filter(p => p.positionMap?.P);
   const catchEligible = availablePlayers.filter(p => playerCanPlay(p, "C") && !pitcherAssignments.some(pa => pa.id === p.id));
-  const addPitcher = (id) => { if (!pitcherAssignments.some(p => p.id === id)) setPitcherAssignments(prev => [...prev, { id, innings: 2, budget: 54 }]); };
-  const removePitcher = (id) => setPitcherAssignments(prev => prev.filter(p => p.id !== id));
-  const updatePitcher = (id, field, value) => setPitcherAssignments(prev => prev.map(p => p.id === id ? { ...p, [field]: value } : p));
-  // Pitcher reorder: HTML5 drag-and-drop on desktop, ↑/↓ buttons for touch.
-  // dragPitcherIdx tracks the source row; clears on drop or dragend.
-  const [dragPitcherIdx, setDragPitcherIdx] = useState(null);
-  const reorderPitcher = (fromIdx, toIdx) => {
-    if (fromIdx === toIdx || fromIdx == null || toIdx == null) return;
-    setPitcherAssignments(prev => {
-      if (fromIdx < 0 || fromIdx >= prev.length) return prev;
-      const clamped = Math.max(0, Math.min(toIdx, prev.length - 1));
-      const next = [...prev];
-      const [moved] = next.splice(fromIdx, 1);
-      next.splice(clamped, 0, moved);
-      return next;
-    });
-  };
-  const addCatcher = (id) => { if (!catcherAssignments.some(c => c.id === id)) setCatcherAssignments(prev => [...prev, { id, innings: 3 }]); };
-  const removeCatcher = (id) => setCatcherAssignments(prev => prev.filter(c => c.id !== id));
-  const updateCatcher = (id, field, value) => setCatcherAssignments(prev => prev.map(c => c.id === id ? { ...c, [field]: value } : c));
+  // The pitcher/catcher mutation helpers + drag state now live inside the
+  // shared <PitchingPlan> / <CatchingPlan> components; SetupTab only needs
+  // the totals below for the Generate-button gate.
   const totalPitcherInnings = pitcherAssignments.reduce((s, p) => s + p.innings, 0);
   const totalCatcherInnings = catcherAssignments.reduce((s, c) => s + c.innings, 0);
   const canGenerate = pitcherAssignments.length > 0 && catcherAssignments.length > 0 && totalPitcherInnings >= gameInnings && totalCatcherInnings >= gameInnings && availablePlayers.length >= 9;
@@ -3741,147 +4071,24 @@ function SetupTab({ roster, setRoster, availablePlayers, absentIds, setAbsentIds
         <div style={{ fontSize: 12, color: C.textLight, marginTop: 10, fontStyle: "italic" }}>Tap a player to mark them absent</div>
       </Section>
 
-      <Section title={`Pitching Plan (${totalPitcherInnings}/${gameInnings} inn)`} defaultOpen={!isMobile} alert={totalPitcherInnings < gameInnings ? `Need ${gameInnings - totalPitcherInnings} more innings` : null} success={totalPitcherInnings >= gameInnings}>
-        {pitcherAssignments.map((pa, idx) => {
-          const player = roster.find(p => p.id === pa.id);
-          const avail = pitcherAvailability[pa.id];
-          const isDragSource = dragPitcherIdx === idx;
-          return (
-            <div
-              key={pa.id}
-              draggable
-              onDragStart={(e) => { setDragPitcherIdx(idx); try { e.dataTransfer.effectAllowed = "move"; } catch {} }}
-              onDragOver={(e) => { if (dragPitcherIdx !== null) e.preventDefault(); }}
-              onDrop={(e) => { e.preventDefault(); if (dragPitcherIdx !== null && dragPitcherIdx !== idx) reorderPitcher(dragPitcherIdx, idx); setDragPitcherIdx(null); }}
-              onDragEnd={() => setDragPitcherIdx(null)}
-              title="Drag to reorder, or use the arrows on the right"
-              style={{
-                display: "flex", alignItems: "center", gap: 10,
-                padding: "10px 0", borderBottom: `1px solid ${C.borderLight}`,
-                flexWrap: "wrap", cursor: "grab",
-                opacity: isDragSource ? 0.4 : 1,
-                background: isDragSource ? C.surfaceAlt : "transparent",
-                transition: "opacity 0.1s, background 0.1s",
-              }}
-            >
-              <span style={{ color: C.accent, fontWeight: 700, width: 22, textAlign: "center", fontSize: 14, userSelect: "none" }}>{idx + 1}</span>
-              <span style={{ fontWeight: 600, minWidth: 80, fontSize: 14 }}>{player?.name}</span>
-              <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
-                <label style={{ fontSize: 12, color: C.textMuted }}>Inn:</label>
-                {[1,2,3,4,5,6,7].map(n => <button key={n} onClick={() => updatePitcher(pa.id, "innings", n)} style={{ ...miniChipStyle, background: pa.innings === n ? C.accent : C.surface, color: pa.innings === n ? "#fff" : C.textMuted, borderColor: pa.innings === n ? C.accent : C.border }}>{n}</button>)}
-              </div>
-              <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
-                <label style={{ fontSize: 12, color: C.textMuted }}>Budget:</label>
-                {ARM_CARE.budgetOptions.map(b => <button key={b} onClick={() => updatePitcher(pa.id, "budget", b)} style={{ ...miniChipStyle, background: pa.budget === b ? C.blue : C.surface, color: pa.budget === b ? "#fff" : C.textMuted, borderColor: pa.budget === b ? C.blue : C.border, fontSize: 11 }}>{b}</button>)}
-              </div>
-              {avail && (
-                <span style={{
-                  fontSize: 11, padding: "3px 8px", borderRadius: 12, fontWeight: 600,
-                  background: !avail.available ? C.redLight : avail.hasWarnings ? C.orangeLight : C.greenLight,
-                  color:      !avail.available ? C.redText  : avail.hasWarnings ? C.orange      : C.greenText,
-                }}>{!avail.available ? "Unavailable" : avail.hasWarnings ? "Restricted" : "Available"}</span>
-              )}
-              <span style={{ fontSize: 11, color: C.textMuted }}>{"\u2192"} {getRestLabel(pa.budget)} rest</span>
-              <div style={{ display: "flex", gap: 4, alignItems: "center", marginLeft: "auto" }}>
-                <button onClick={() => reorderPitcher(idx, idx - 1)} disabled={idx === 0} title="Move up"
-                  style={{ ...miniChipStyle, padding: "3px 8px", fontSize: 12, opacity: idx === 0 ? 0.3 : 1, cursor: idx === 0 ? "default" : "pointer" }}>{"\u2191"}</button>
-                <button onClick={() => reorderPitcher(idx, idx + 1)} disabled={idx === pitcherAssignments.length - 1} title="Move down"
-                  style={{ ...miniChipStyle, padding: "3px 8px", fontSize: 12, opacity: idx === pitcherAssignments.length - 1 ? 0.3 : 1, cursor: idx === pitcherAssignments.length - 1 ? "default" : "pointer" }}>{"\u2193"}</button>
-                <button onClick={() => removePitcher(pa.id)} title="Remove pitcher" style={{ ...miniChipStyle, color: C.red, borderColor: C.red }}>&times;</button>
-              </div>
-              {avail && avail.warnings && avail.warnings.length > 0 && (
-                <div style={{ flexBasis: "100%", display: "flex", flexDirection: "column", gap: 2, marginLeft: 32, marginTop: -4 }}>
-                  {avail.warnings.map((w, i) => (
-                    <span key={i} style={{ fontSize: 11, color: C.orange, fontWeight: 500 }}>
-                      <span style={{ marginRight: 4 }}>{"\u26a0"}</span>{w.msg}
-                    </span>
-                  ))}
-                </div>
-              )}
-            </div>
-          );
-        })}
-        {(() => {
-          const unassigned = pitchEligible.filter(p => !pitcherAssignments.some(pa => pa.id === p.id));
-          const available   = unassigned.filter(p => pitcherAvailability[p.id]?.available !== false);
-          const unavailable = unassigned.filter(p => pitcherAvailability[p.id]?.available === false);
-          return (
-            <React.Fragment>
-              <div style={{ marginTop: 14 }}>
-                <div style={{ fontSize: 12, color: C.textMuted, marginBottom: 8, fontWeight: 500 }}>Available arms:</div>
-                <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-                  {available.length === 0 && (
-                    <span style={{ fontSize: 12, color: C.textLight, fontStyle: "italic" }}>None — all eligible pitchers are already assigned or resting.</span>
-                  )}
-                  {available.map(p => {
-                    const avail = pitcherAvailability[p.id];
-                    const hasWarn = !!avail?.hasWarnings;
-                    const tip = avail?.warnings?.length > 0 ? avail.warnings.map(w => w.msg).join(" · ") : avail?.reason;
-                    return <button key={p.id} onClick={() => addPitcher(p.id)} title={tip || ""} style={{
-                        ...chipStyle, padding: "6px 12px",
-                        background:  hasWarn ? C.orangeLight : C.greenLight,
-                        borderColor: hasWarn ? C.orange      : C.green,
-                        color:       hasWarn ? C.orange      : C.greenText,
-                      }}>
-                      {hasWarn && <span style={{ marginRight: 4 }}>{"⚠"}</span>}{p.name}
-                    </button>;
-                  })}
-                </div>
-              </div>
-              {unavailable.length > 0 && (
-                <div style={{ marginTop: 14 }}>
-                  <div style={{ fontSize: 12, color: C.textMuted, marginBottom: 8, fontWeight: 500 }}>Unavailable:</div>
-                  <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-                    {unavailable.map(p => {
-                      const avail = pitcherAvailability[p.id];
-                      return <button key={p.id} disabled title={avail?.reason || "Unavailable"} style={{
-                          ...chipStyle, padding: "6px 12px",
-                          opacity: 0.5, cursor: "not-allowed",
-                          background: C.redLight, borderColor: C.red, color: C.redText,
-                        }}>
-                        {p.name}
-                      </button>;
-                    })}
-                  </div>
-                </div>
-              )}
-            </React.Fragment>
-          );
-        })()}
-      </Section>
+      <PitchingPlan
+        roster={roster}
+        pitcherAssignments={pitcherAssignments}
+        setPitcherAssignments={setPitcherAssignments}
+        pitcherAvailability={pitcherAvailability}
+        pitchEligible={pitchEligible}
+        gameInnings={gameInnings}
+        defaultOpen={!isMobile}
+      />
 
-      <Section title={`Catching Plan (${totalCatcherInnings}/${gameInnings} inn)`} defaultOpen={!isMobile} alert={totalCatcherInnings < gameInnings ? `Need ${gameInnings - totalCatcherInnings} more innings` : null} success={totalCatcherInnings >= gameInnings}>
-        {catcherAssignments.map((ca, idx) => {
-          const player = roster.find(p => p.id === ca.id);
-          return (
-            <div key={ca.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 0", borderBottom: `1px solid ${C.borderLight}` }}>
-              <span style={{ color: C.accent, fontWeight: 700, width: 22, textAlign: "center", fontSize: 14 }}>{idx + 1}</span>
-              <span style={{ fontWeight: 600, minWidth: 80, fontSize: 14 }}>{player?.name}</span>
-              <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
-                <label style={{ fontSize: 12, color: C.textMuted }}>Inn:</label>
-                {[1,2,3,4,5,6].map(n => <button key={n} onClick={() => updateCatcher(ca.id, "innings", n)} style={{ ...miniChipStyle, background: ca.innings === n ? C.accent : C.surface, color: ca.innings === n ? "#fff" : C.textMuted, borderColor: ca.innings === n ? C.accent : C.border }}>{n}</button>)}
-              </div>
-              <button onClick={() => removeCatcher(ca.id)} style={{ ...miniChipStyle, color: C.red, borderColor: C.red, marginLeft: "auto" }}>&times;</button>
-            </div>
-          );
-        })}
-        <div style={{ marginTop: 14 }}>
-          <div style={{ fontSize: 12, color: C.textMuted, marginBottom: 8, fontWeight: 500 }}>Available catchers:</div>
-          <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-            {catchEligible
-              .filter(p => !catcherAssignments.some(ca => ca.id === p.id))
-              .slice()
-              .sort((a, b) => (TIER_SCORE[playerTier(b, "C")] || 0) - (TIER_SCORE[playerTier(a, "C")] || 0))
-              .map(p => {
-                const tier = playerTier(p, "C");
-                return <button key={p.id} onClick={() => addCatcher(p.id)} style={{ ...chipStyle, padding: "6px 12px", background: C.surface, borderColor: TIER_COLORS[tier] || C.border }}>
-                  <span style={{ display: "inline-block", width: 7, height: 7, borderRadius: "50%", background: TIER_COLORS[tier] || C.textLight, marginRight: 6 }} />
-                  {p.name}
-                </button>;
-            })}
-          </div>
-        </div>
-      </Section>
+      <CatchingPlan
+        roster={roster}
+        catcherAssignments={catcherAssignments}
+        setCatcherAssignments={setCatcherAssignments}
+        catchEligible={catchEligible}
+        gameInnings={gameInnings}
+        defaultOpen={!isMobile}
+      />
 
       {/* Roster Priority \u2014 same combined editor that lives on the Team
           Reports tab. Rendered top-level (not inside a Section) so it's
@@ -4080,10 +4287,16 @@ function LineupListView({ schedule, roster, onEditEntry }) {
 // ══════════════════════════════════════════════════
 // LINEUP TAB (with swap, finalize, PNG, color summary)
 // ══════════════════════════════════════════════════
-function LineupTab({ grid, setGrid, posHistory, benchCount, roster, fullRoster, warnings, innings, pitcherAssignments, catcherAssignments, benchTiers, gameMeta, isFinalized, setIsFinalized, generationId, isLinkedToSchedule = false, isPlayed = false, pitchLogsForGame = [], onSavePitchLog = () => {}, onDeleteLineup = () => {}, onRevalidate, onBack, canEdit = true, prevGame = null, nextGame = null, onNavigateToGame = () => {}, schedule = [] }) {
+function LineupTab({ grid, setGrid, posHistory, benchCount, roster, fullRoster, warnings, innings, pitcherAssignments, catcherAssignments, benchTiers, gameMeta, isFinalized, setIsFinalized, generationId, isLinkedToSchedule = false, isPlayed = false, pitchLogsForGame = [], onSavePitchLog = () => {}, onDeleteLineup = () => {}, onRevalidate, onBack, canEdit = true, prevGame = null, nextGame = null, onNavigateToGame = () => {}, schedule = [], onReturnToList = null, pitcherAvailability = {}, onRegenerateWithPlan = null }) {
   const isMobile = useIsMobile();
   const [pitchLogModalOpen, setPitchLogModalOpen] = useState(false);
   const [confirmDeleteLineup, setConfirmDeleteLineup] = useState(false);
+  const [editPlanOpen, setEditPlanOpen] = useState(false);
+  // Pitch-eligible / catch-eligible derived from the current roster (already
+  // filtered for absences in App). The EditPlanModal needs both lists to
+  // render the "Available arms" / "Available catchers" chips.
+  const pitchEligibleForModal = (roster || []).filter(p => p.positionMap?.P);
+  const catchEligibleForModal = (roster || []).filter(p => playerCanPlay(p, "C") && !pitcherAssignments.some(pa => pa.id === p.id));
   // Celebratory "Lineup is saved." modal that pops on finalize. Holds the
   // download shortcuts so the coach can grab a copy before heading to the
   // dugout — closes via the "Play ball!" CTA.
@@ -4521,12 +4734,12 @@ function LineupTab({ grid, setGrid, posHistory, benchCount, roster, fullRoster, 
 
   return (
     <div>
-      {/* Breadcrumb back to the Lineups list — only meaningful when this
-          lineup is tied to a schedule entry (the list pulls from saved
-          schedule games). For one-off lineups the user gets to Setup via
-          the bottom action row instead. */}
-      {isLinkedToSchedule && (
-        <button onClick={onBack} style={{
+      {/* Breadcrumb back to the Lineups list. Distinct from the bottom
+          "Back to Setup" button — the breadcrumb returns to the overview,
+          the bottom button goes back to the planning form so the coach
+          can tweak attendance / pitching / catching and regenerate. */}
+      {isLinkedToSchedule && onReturnToList && (
+        <button onClick={onReturnToList} style={{
           background: "transparent", border: "none", color: C.textMuted,
           fontSize: 12, fontFamily: FONT, cursor: "pointer", padding: "0 0 6px 0",
           display: "inline-flex", alignItems: "center", gap: 4, fontWeight: 500,
@@ -4535,54 +4748,101 @@ function LineupTab({ grid, setGrid, posHistory, benchCount, roster, fullRoster, 
 
       {/* Prev/next nav between games with saved lineups. Hidden when this
           lineup isn't tied to a schedule entry, or when there's only one
-          game in the season so there's nothing to navigate to. */}
-      {isLinkedToSchedule && (prevGame || nextGame) && (
-        <div style={{ marginBottom: 10, display: "flex", alignItems: "center", gap: 8 }}>
-          <button onClick={() => prevGame && onNavigateToGame(prevGame)} disabled={!prevGame}
-            title={prevGame ? `Previous game: ${formatNavLabel(prevGame)}` : "This is the earliest game with a saved lineup"}
-            style={{
-              ...miniChipStyle, fontSize: 12, padding: "5px 12px", fontWeight: 500,
-              opacity: prevGame ? 1 : 0.35, cursor: prevGame ? "pointer" : "default",
-              flex: "0 1 auto", minWidth: 0, maxWidth: "45%",
-              overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
-            }}>
-            {"← "}{prevGame ? formatNavLabel(prevGame) : "—"}
-          </button>
-          <div style={{ flex: 1 }} />
-          <button onClick={() => nextGame && onNavigateToGame(nextGame)} disabled={!nextGame}
-            title={nextGame ? `Next game: ${formatNavLabel(nextGame)}` : "This is the latest game with a saved lineup"}
-            style={{
-              ...miniChipStyle, fontSize: 12, padding: "5px 12px", fontWeight: 500,
-              opacity: nextGame ? 1 : 0.35, cursor: nextGame ? "pointer" : "default",
-              flex: "0 1 auto", minWidth: 0, maxWidth: "45%",
-              overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
-            }}>
-            {nextGame ? formatNavLabel(nextGame) : "—"}{" →"}
-          </button>
-        </div>
-      )}
+          game in the season so there's nothing to navigate to. Boundary
+          buttons (no prev / no next) are simply hidden — the spacer keeps
+          the remaining button anchored to its side. */}
+      {isLinkedToSchedule && (prevGame || nextGame) && (() => {
+        const navBtnStyle = {
+          ...miniChipStyle,
+          fontSize: isMobile ? 13 : 12,
+          padding: isMobile ? "8px 14px" : "5px 12px",
+          minHeight: isMobile ? 36 : 0,
+          fontWeight: 500, cursor: "pointer",
+          flex: "0 1 auto", minWidth: 0, maxWidth: "45%",
+          overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+        };
+        return (
+          <div style={{ marginBottom: 10, display: "flex", alignItems: "center", gap: 8 }}>
+            {prevGame && (
+              <button onClick={() => onNavigateToGame(prevGame)}
+                title={`Previous game: ${formatNavLabel(prevGame)}`}
+                style={navBtnStyle}>
+                {"← "}{formatNavLabel(prevGame)}
+              </button>
+            )}
+            <div style={{ flex: 1 }} />
+            {nextGame && (
+              <button onClick={() => onNavigateToGame(nextGame)}
+                title={`Next game: ${formatNavLabel(nextGame)}`}
+                style={navBtnStyle}>
+                {formatNavLabel(nextGame)}{" →"}
+              </button>
+            )}
+          </div>
+        );
+      })()}
 
-      {/* Game header — opponent + date + time + type pinned at the top so the
-          coach knows which game they're editing, especially when bouncing
-          between several entries from the schedule in one session. */}
-      {showGameHeader && (
-        <div style={{ marginBottom: 14, padding: "10px 14px", background: C.surface, border: `1px solid ${C.border}`, borderRadius: 8, display: "flex", flexWrap: "wrap", alignItems: "baseline", gap: "4px 12px" }}>
-          {gameMeta?.opponent ? (
-            <span style={{ fontFamily: DISPLAY, fontSize: 18, fontWeight: 700, color: C.text }}>
-              {gameMeta.homeAway === "away" ? "@ " : "vs "}{gameMeta.opponent}
-            </span>
-          ) : (
-            <span style={{ fontFamily: DISPLAY, fontSize: 18, fontWeight: 700, color: C.textMuted, fontStyle: "italic" }}>
-              Untitled game
-            </span>
-          )}
-          {headerSubParts.length > 0 && (
-            <span style={{ fontSize: 13, color: C.textMuted }}>
-              {headerSubParts.join(" · ")}
-            </span>
-          )}
-        </div>
-      )}
+      {/* Game header — opponent + date + time + type pinned at the top, with
+          the lock/download controls folded in to the right when finalized.
+          Past games get a blue tint so a locked game from last week reads
+          differently from a locked game tomorrow. Both remain editable. */}
+      {showGameHeader && (() => {
+        const todayISO = new Date().toISOString().slice(0, 10);
+        const isPastGame = !!(gameMeta?.date && gameMeta.date < todayISO);
+        // Color logic:
+        //   future + finalized → green tint (current "ready to share" look)
+        //   past   + finalized → blue tint (this game has happened)
+        //   past   + not final → subtle blue border on a neutral bar
+        //   future + not final → plain neutral bar
+        const baseBg     = isFinalized ? (isPastGame ? C.blueLight : C.greenLight) : C.surface;
+        const baseBorder = isFinalized
+          ? (isPastGame ? C.blue : C.green)
+          : (isPastGame ? C.blue : C.border);
+        const lockedFg   = isPastGame ? C.blue : C.greenText;
+        const lockedLabel = isPastGame ? "Past game · Locked" : "Lineup Locked";
+        const lockedSub   = isPastGame ? (isPlayed ? "Played" : "Already happened") : "Ready to share";
+        const pngBg       = isPastGame ? C.blue   : C.accent;
+        return (
+          <div style={{
+            marginBottom: 14, padding: "10px 14px",
+            background: baseBg, border: `1px solid ${baseBorder}`, borderRadius: 8,
+            display: "flex", flexWrap: "wrap", alignItems: "center",
+            gap: "8px 12px",
+          }}>
+            <div style={{ display: "flex", flexWrap: "wrap", alignItems: "baseline", gap: "4px 12px", minWidth: 0, flex: "1 1 240px" }}>
+              {gameMeta?.opponent ? (
+                <span style={{ fontFamily: DISPLAY, fontSize: 18, fontWeight: 700, color: C.text }}>
+                  {gameMeta.homeAway === "away" ? "@ " : "vs "}{gameMeta.opponent}
+                </span>
+              ) : (
+                <span style={{ fontFamily: DISPLAY, fontSize: 18, fontWeight: 700, color: C.textMuted, fontStyle: "italic" }}>
+                  Untitled game
+                </span>
+              )}
+              {headerSubParts.length > 0 && (
+                <span style={{ fontSize: 13, color: C.textMuted }}>
+                  {headerSubParts.join(" · ")}
+                </span>
+              )}
+              {isPastGame && !isFinalized && (
+                <span style={{ fontSize: 11, padding: "2px 8px", borderRadius: 12, background: C.blueLight, color: C.blue, fontWeight: 600, border: `1px solid ${C.blue}` }}>
+                  {isPlayed ? "Played" : "Past game"}
+                </span>
+              )}
+            </div>
+            {isFinalized && (
+              <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                <span style={{ display: "inline-flex", alignItems: "baseline", gap: 6, color: lockedFg, fontWeight: 600, fontSize: 13 }}>
+                  <span>{"✓"} {lockedLabel}</span>
+                  <span style={{ color: C.textMuted, fontWeight: 400, fontSize: 12 }}>{lockedSub}</span>
+                </span>
+                <button onClick={handleExportGameDay} style={{ ...chipStyle, padding: "6px 14px", fontWeight: 600, fontSize: 12 }}>Download Gameday HTML</button>
+                <button onClick={handleDownloadPNG} style={{ ...chipStyle, background: pngBg, color: "#fff", borderColor: pngBg, padding: "6px 14px", fontWeight: 600, fontSize: 12 }}>Download PNG</button>
+              </div>
+            )}
+          </div>
+        );
+      })()}
 
       {/* Validation ticker — sticky at top so you can cycle through issues while swapping */}
       {false && canEdit && activeTicker && (() => {
@@ -4608,15 +4868,9 @@ function LineupTab({ grid, setGrid, posHistory, benchCount, roster, fullRoster, 
         );
       })()}
 
-      {/* Finalized banner */}
-      {isFinalized && (
-        <div style={{ background: C.greenLight, border: `1px solid ${C.green}`, borderRadius: 8, padding: "12px 16px", marginBottom: 16, display: "flex", alignItems: "center", gap: 10 }}>
-          <span style={{ color: C.greenText, fontWeight: 600, fontSize: 14 }}>{"\u2713"} Lineup Locked</span>
-          <span style={{ color: C.textMuted, fontSize: 13, flex: 1 }}>Ready to share</span>
-          <button onClick={handleExportGameDay} style={{ ...chipStyle, padding: "6px 16px", fontWeight: 600 }}>Download Gameday HTML</button>
-          <button onClick={handleDownloadPNG} style={{ ...chipStyle, background: C.accent, color: "#fff", borderColor: C.accent, padding: "6px 16px", fontWeight: 600 }}>Download PNG</button>
-        </div>
-      )}
+      {/* Finalized banner removed 2026-05-04 \u2014 its lock indicator and download
+          buttons are now folded into the game header above so the editor opens
+          with one consolidated bar instead of two stacked rows. */}
 
       {/* Validation panel \u2014 collapsed by default; tap title to expand. The
           ticker above already surfaces high-severity issues one at a time, so
@@ -4881,7 +5135,14 @@ function LineupTab({ grid, setGrid, posHistory, benchCount, roster, fullRoster, 
         alignItems: isMobile ? "stretch" : "center",
         gap: 10, marginTop: 28, flexWrap: "wrap",
       }}>
-        <button onClick={onBack} style={{ ...chipStyle, padding: "10px 28px", background: C.surface, borderColor: C.accent, color: C.accent, fontSize: 14, fontWeight: 600 }}>{"\u2190"} {isLinkedToSchedule ? "All lineups" : (canEdit ? "Back to Setup" : "Back to Schedule")}</button>
+        <button onClick={onBack} style={{ ...chipStyle, padding: "10px 28px", background: C.surface, borderColor: C.accent, color: C.accent, fontSize: 14, fontWeight: 600 }}>{"\u2190"} {canEdit ? "Back to Setup" : "Back to Schedule"}</button>
+        {canEdit && grid && onRegenerateWithPlan && (
+          <button onClick={() => setEditPlanOpen(true)}
+            title="Tweak pitchers / catchers and regenerate the lineup without leaving this page"
+            style={{ ...chipStyle, padding: "10px 28px", background: C.surface, borderColor: C.accent, color: C.accent, fontSize: 14, fontWeight: 600 }}>
+            Edit pitching / catching
+          </button>
+        )}
         {canEdit && grid && (
           <button onClick={() => setConfirmDeleteLineup(true)}
             style={{ ...chipStyle, padding: "10px 28px", background: C.surface, borderColor: C.red, color: C.redText, fontSize: 14, fontWeight: 600 }}>
@@ -4928,6 +5189,24 @@ function LineupTab({ grid, setGrid, posHistory, benchCount, roster, fullRoster, 
           onCancel={() => setPitchLogModalOpen(false)}
         />
       )}
+
+      <EditPlanModal
+        open={editPlanOpen}
+        onClose={() => setEditPlanOpen(false)}
+        roster={roster}
+        currentPitchers={pitcherAssignments}
+        currentCatchers={catcherAssignments}
+        pitcherAvailability={pitcherAvailability}
+        pitchEligible={pitchEligibleForModal}
+        catchEligible={catchEligibleForModal}
+        gameInnings={innings}
+        onSaveAndRegenerate={(pitchers, catchers) => {
+          if (onRegenerateWithPlan && onRegenerateWithPlan(pitchers, catchers)) {
+            setEditPlanOpen(false);
+          }
+        }}
+      />
+
 
       {savedModalOpen && (
         <div onClick={() => setSavedModalOpen(false)} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.3)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 999, backdropFilter: "blur(2px)" }}>
