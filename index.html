@@ -443,6 +443,7 @@ function formatPublishedAt(ts) {
 // positionMap values may be bare tiers ("preferred") or tier-with-rank ("secondary:2").
 // Rank breaks ties within a tier (1 = top). Missing rank defaults to 1.
 function playerTier(player, pos) {
+  if (!player) return null;
   const raw = player.positionMap?.[pos];
   return raw ? raw.split(":")[0] : null;
 }
