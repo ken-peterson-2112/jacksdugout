@@ -1,5 +1,5 @@
 {
-  "publishedAt": 1778367048066,
+  "publishedAt": 1778384861083,
   "roster": [
     {
       "id": "1",
@@ -112,16 +112,6 @@
         "CF": "secondary:2",
         "RF": "secondary",
         "2B": "secondary"
-      }
-    },
-    {
-      "id": "11",
-      "name": "Kaden",
-      "number": "88",
-      "positionMap": {
-        "LF": "secondary",
-        "RF": "secondary",
-        "P": "emergency"
       }
     },
     {
@@ -479,7 +469,7 @@
         ],
         "absentIds": [],
         "gameInnings": 7,
-        "isFinalized": true
+        "isFinalized": false
       }
     },
     {
@@ -498,12 +488,12 @@
             "BN": [
               "8",
               "5",
-              "2"
+              "1"
             ],
             "1B": "4",
             "2B": "9",
             "3B": "12",
-            "SS": "1",
+            "SS": "2",
             "LF": "6",
             "CF": "3",
             "RF": "7"
@@ -645,7 +635,6 @@
     "5": "flex",
     "6": "flex",
     "7": "flex",
-    "8": "flex",
-    "11": "dev"
+    "8": "flex"
   }
 }
