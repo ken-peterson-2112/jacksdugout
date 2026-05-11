@@ -1,5 +1,5 @@
 {
-  "publishedAt": 1778520290083,
+  "publishedAt": 1778528443097,
   "roster": [
     {
       "id": "1",
@@ -20,8 +20,7 @@
         "P": "preferred",
         "3B": "preferred",
         "SS": "secondary:1",
-        "CF": "secondary:1",
-        "2B": "emergency"
+        "CF": "secondary:1"
       }
     },
     {
@@ -62,16 +61,16 @@
       "positionMap": {
         "LF": "secondary",
         "RF": "secondary",
-        "CF": "emergency",
         "C": "emergency",
         "3B": "secondary",
-        "P": "secondary"
+        "P": "secondary",
+        "CF": "secondary"
       }
     },
     {
       "id": "7",
       "name": "Clay",
-      "number": "3",
+      "number": "97",
       "positionMap": {
         "P": "preferred",
         "RF": "preferred",
@@ -85,8 +84,8 @@
       "positionMap": {
         "LF": "secondary",
         "RF": "secondary",
-        "2B": "emergency",
-        "P": "secondary"
+        "P": "secondary",
+        "2B": "secondary"
       }
     },
     {
@@ -97,8 +96,7 @@
         "P": "preferred",
         "CF": "preferred",
         "C": "secondary",
-        "2B": "secondary:1",
-        "SS": "emergency"
+        "2B": "secondary:1"
       }
     },
     {
@@ -293,7 +291,8 @@
         ],
         "gameInnings": 7,
         "isFinalized": true
-      }
+      },
+      "played": true
     },
     {
       "id": "sch_1777861869259_333",
@@ -470,7 +469,8 @@
         "absentIds": [],
         "gameInnings": 7,
         "isFinalized": true
-      }
+      },
+      "played": true
     },
     {
       "id": "sch_1777863528407_605",
@@ -488,13 +488,13 @@
             "BN": [
               "8",
               "6",
-              "1"
+              "5"
             ],
             "1B": "4",
             "2B": "9",
-            "3B": "12",
-            "SS": "2",
-            "LF": "5",
+            "3B": "2",
+            "SS": "1",
+            "LF": "12",
             "CF": "3",
             "RF": "7"
           },
@@ -534,7 +534,7 @@
             "P": "12",
             "C": "9",
             "BN": [
-              "5",
+              "10",
               "2",
               "8"
             ],
@@ -542,8 +542,8 @@
             "2B": "13",
             "3B": "4",
             "SS": "1",
-            "LF": "6",
-            "CF": "10",
+            "LF": "5",
+            "CF": "6",
             "RF": "7"
           },
           {
@@ -626,15 +626,72 @@
           "11"
         ],
         "gameInnings": 7,
-        "isFinalized": true
+        "isFinalized": false
       }
     }
   ],
-  "pitchLogs": [],
+  "pitchLogs": [
+    {
+      "id": "pl_1778522343354_10_357",
+      "playerId": "10",
+      "pitches": 43,
+      "date": "2026-05-07",
+      "opponent": "Whitby T2",
+      "scheduleId": "sch_1777861919832_173"
+    },
+    {
+      "id": "pl_1778522343354_4_369",
+      "playerId": "4",
+      "pitches": 39,
+      "date": "2026-05-07",
+      "opponent": "Whitby T2",
+      "scheduleId": "sch_1777861919832_173"
+    },
+    {
+      "id": "pl_1778522343354_5_569",
+      "playerId": "5",
+      "pitches": 12,
+      "date": "2026-05-07",
+      "opponent": "Whitby T2",
+      "scheduleId": "sch_1777861919832_173"
+    },
+    {
+      "id": "pl_1778522343354_3_343",
+      "playerId": "3",
+      "pitches": 37,
+      "date": "2026-05-07",
+      "opponent": "Whitby T2",
+      "scheduleId": "sch_1777861919832_173"
+    },
+    {
+      "id": "pl_1778522440401_9_586",
+      "playerId": "9",
+      "pitches": 51,
+      "date": "2026-05-10",
+      "opponent": "Pickering T2",
+      "scheduleId": "sch_1777861609780_442"
+    },
+    {
+      "id": "pl_1778522440401_7_225",
+      "playerId": "7",
+      "pitches": 25,
+      "date": "2026-05-10",
+      "opponent": "Pickering T2",
+      "scheduleId": "sch_1777861609780_442"
+    },
+    {
+      "id": "pl_1778522440401_1_722",
+      "playerId": "1",
+      "pitches": 48,
+      "date": "2026-05-10",
+      "opponent": "Pickering T2",
+      "scheduleId": "sch_1777861609780_442"
+    }
+  ],
   "benchTiers": {
-    "5": "flex",
-    "6": "flex",
-    "7": "flex",
-    "8": "flex"
+    "5": "regular",
+    "6": "regular",
+    "7": "regular",
+    "8": "regular"
   }
 }
