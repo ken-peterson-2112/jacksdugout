@@ -2587,6 +2587,19 @@ function App() {
   }, [editableGrid]);
 
   // Load a schedule entry into the active editing state. If a saved lineup is
+  // Game Day view — shows the full-screen mobile experience for live game use.
+  const [gameDayEntry, setGameDayEntry] = useState(null);
+  const handleOpenGameDay = useCallback((entry) => {
+    setGameDayEntry(entry);
+  }, []);
+  const handleSaveGameDayGrid = useCallback((newGrid) => {
+    setSchedule(prev => prev.map(e =>
+      e.id === gameDayEntry?.id
+        ? { ...e, lineup: { ...(e.lineup || {}), grid: newGrid } }
+        : e
+    ));
+  }, [gameDayEntry]);
+
   // present, route to the Lineup tab; otherwise jump to Game Settings so the
   // coach can build one.
   const handleOpenScheduleEntry = (entry) => {
@@ -2859,6 +2872,7 @@ function App() {
           prevGame={prevGame}
           nextGame={nextGame}
           onNavigateToGame={handleOpenScheduleEntry}
+          onOpenGameDay={handleOpenGameDay}
           schedule={schedule}
           pitcherAvailability={pitcherAvailability}
           onRegenerateWithPlan={handleRegenerateWithPlan} />}
@@ -2872,6 +2886,15 @@ function App() {
         localPublishedAt={localPublishedAt}
         serverPublishedAt={serverTeamData?.publishedAt}
       />
+      {gameDayEntry && (
+        <GameDayView
+          entry={gameDayEntry}
+          roster={sortedRoster}
+          benchTiers={benchTiers}
+          onSave={handleSaveGameDayGrid}
+          onClose={() => setGameDayEntry(null)}
+        />
+      )}
     </div>
   );
 }
@@ -4126,7 +4149,7 @@ function SetupTab({ roster, setRoster, availablePlayers, absentIds, setAbsentIds
 // with the planned pitchers + catchers prominent and quick actions for
 // Edit / Download PNG / Download Gameday HTML.
 // ══════════════════════════════════════════════════
-function LineupListView({ schedule, roster, onEditEntry }) {
+function LineupListView({ schedule, roster, onEditEntry, onOpenGameDay = () => {} }) {
   const games = useMemo(() => {
     return (schedule || [])
       .filter(g => g && g.kind === "game" && g.lineup && Array.isArray(g.lineup.grid))
@@ -4268,6 +4291,10 @@ function LineupListView({ schedule, roster, onEditEntry }) {
                   background: C.accent, border: `1px solid ${C.accent}`, color: "#fff",
                   padding: "8px 18px", borderRadius: 6, fontFamily: FONT, fontSize: 13, fontWeight: 600, cursor: "pointer",
                 }}>Edit</button>
+                <button onClick={() => onOpenGameDay(entry)} style={{
+                  background: C.blue, border: `1px solid ${C.blue}`, color: "#fff",
+                  padding: "8px 18px", borderRadius: 6, fontFamily: FONT, fontSize: 13, fontWeight: 600, cursor: "pointer",
+                }}>Game Day</button>
                 <button onClick={() => downloadPNGForLineup({ grid, posHistory, roster, innings, gameMeta })} style={{
                   background: C.surface, border: `1px solid ${C.border}`, color: C.text,
                   padding: "8px 16px", borderRadius: 6, fontFamily: FONT, fontSize: 13, fontWeight: 500, cursor: "pointer",
@@ -4288,7 +4315,7 @@ function LineupListView({ schedule, roster, onEditEntry }) {
 // ══════════════════════════════════════════════════
 // LINEUP TAB (with swap, finalize, PNG, color summary)
 // ══════════════════════════════════════════════════
-function LineupTab({ grid, setGrid, posHistory, benchCount, roster, fullRoster, warnings, innings, pitcherAssignments, catcherAssignments, benchTiers, gameMeta, isFinalized, setIsFinalized, generationId, isLinkedToSchedule = false, isPlayed = false, pitchLogsForGame = [], onSavePitchLog = () => {}, onDeleteLineup = () => {}, onRevalidate, onBack, canEdit = true, prevGame = null, nextGame = null, onNavigateToGame = () => {}, schedule = [], onReturnToList = null, pitcherAvailability = {}, onRegenerateWithPlan = null }) {
+function LineupTab({ grid, setGrid, posHistory, benchCount, roster, fullRoster, warnings, innings, pitcherAssignments, catcherAssignments, benchTiers, gameMeta, isFinalized, setIsFinalized, generationId, isLinkedToSchedule = false, isPlayed = false, pitchLogsForGame = [], onSavePitchLog = () => {}, onDeleteLineup = () => {}, onRevalidate, onBack, canEdit = true, prevGame = null, nextGame = null, onNavigateToGame = () => {}, onOpenGameDay = () => {}, schedule = [], onReturnToList = null, pitcherAvailability = {}, onRegenerateWithPlan = null }) {
   const isMobile = useIsMobile();
   const [pitchLogModalOpen, setPitchLogModalOpen] = useState(false);
   const [confirmDeleteLineup, setConfirmDeleteLineup] = useState(false);
@@ -4411,6 +4438,7 @@ function LineupTab({ grid, setGrid, posHistory, benchCount, roster, fullRoster, 
         schedule={schedule}
         roster={fullRoster || roster}
         onEditEntry={onNavigateToGame}
+        onOpenGameDay={onOpenGameDay}
       />
     );
   }
@@ -5450,6 +5478,386 @@ function BenchScoreBadge({ count, size = "sm" }) {
     }}>
       {size === "md" ? count : null}
     </span>
+  );
+}
+
+// ══════════════════════════════════════════════════
+// GAME DAY VIEW
+// Full-screen mobile-first experience for use at the game.
+// Portrait-optimised for 1080×2424.
+//   • Sticky header: game title + inning pip nav + swipe
+//   • 4×3 player number grid with BenchScoreBadge per player
+//   • Tap a number → bottom-sheet showing that player's full
+//     7-inning sequence
+//   • One-inning-at-a-time field panel: 9 positions + 3 bench
+//     slots (tap any two cells to swap, same two-tap mechanic
+//     as the exported HTML)
+//   • Swaps write back to the schedule entry via onSave so
+//     Supabase cloud-sync picks them up automatically
+// ══════════════════════════════════════════════════
+const GD_FIELD_POS = ["P","C","1B","2B","3B","SS","LF","CF","RF"];
+const GD_BN_COUNT  = 3;
+const GD_SLOTS     = [...GD_FIELD_POS, "BN-0","BN-1","BN-2"];
+
+function GameDayView({ entry, roster, benchTiers, onSave, onClose }) {
+  const lineup       = entry.lineup || {};
+  const totalInnings = lineup.gameInnings || (Array.isArray(lineup.grid) ? lineup.grid.length : 6);
+  const originalGrid = lineup.grid || [];
+
+  const [grid,          setGrid]          = useState(() => JSON.parse(JSON.stringify(originalGrid)));
+  const [inn,           setInn]           = useState(0);
+  const [swapSel,       setSwapSel]       = useState(null); // { innIdx, slotKey }
+  const [playerModalId, setPlayerModalId] = useState(null);
+
+  const saveGrid = useCallback((newGrid) => {
+    setGrid(newGrid);
+    onSave(newGrid);
+  }, [onSave]);
+
+  const playerMap = useMemo(() => {
+    const m = {};
+    (roster || []).forEach(p => { m[p.id] = p; });
+    return m;
+  }, [roster]);
+
+  const { posHistory, benchCount } = useMemo(
+    () => recomputeFromGrid(grid, roster || []),
+    [grid, roster]
+  );
+
+  // Swipe left/right to change inning
+  const touchStartX = useRef(null);
+  const handleTouchStart = useCallback(e => { touchStartX.current = e.touches[0].clientX; }, []);
+  const handleTouchEnd   = useCallback(e => {
+    if (touchStartX.current === null) return;
+    const dx = e.changedTouches[0].clientX - touchStartX.current;
+    touchStartX.current = null;
+    if (Math.abs(dx) < 44) return;
+    if (dx < 0) setInn(i => Math.min(i + 1, totalInnings - 1));
+    else         setInn(i => Math.max(i - 1, 0));
+  }, [totalInnings]);
+
+  const getCellPlayer = useCallback((innIdx, slotKey) => {
+    if (slotKey.startsWith("BN-")) {
+      return (grid[innIdx]?.BN || [])[parseInt(slotKey.slice(3), 10)] || null;
+    }
+    return grid[innIdx]?.[slotKey] || null;
+  }, [grid]);
+
+  const applyCellPlayer = useCallback((g, innIdx, slotKey, playerId) => {
+    const ng = JSON.parse(JSON.stringify(g));
+    if (slotKey.startsWith("BN-")) {
+      const bnIdx = parseInt(slotKey.slice(3), 10);
+      if (!ng[innIdx].BN) ng[innIdx].BN = [];
+      while (ng[innIdx].BN.length <= bnIdx) ng[innIdx].BN.push(null);
+      ng[innIdx].BN[bnIdx] = playerId;
+    } else {
+      ng[innIdx][slotKey] = playerId;
+    }
+    return ng;
+  }, []);
+
+  const handleCellTap = useCallback((innIdx, slotKey) => {
+    if (!swapSel) { setSwapSel({ innIdx, slotKey }); return; }
+    if (swapSel.innIdx === innIdx && swapSel.slotKey === slotKey) { setSwapSel(null); return; }
+    const aP = getCellPlayer(swapSel.innIdx, swapSel.slotKey);
+    const bP = getCellPlayer(innIdx, slotKey);
+    let ng = applyCellPlayer(grid, swapSel.innIdx, swapSel.slotKey, bP);
+        ng = applyCellPlayer(ng,   innIdx,         slotKey,          aP);
+    setSwapSel(null);
+    saveGrid(ng);
+  }, [swapSel, grid, getCellPlayer, applyCellPlayer, saveGrid]);
+
+  const handleReset = useCallback(() => {
+    if (!window.confirm("Reset all innings back to the original plan?")) return;
+    saveGrid(JSON.parse(JSON.stringify(originalGrid)));
+    setSwapSel(null);
+  }, [originalGrid, saveGrid]);
+
+  // Players who actually appear in this game's grid
+  const activePlayers = useMemo(() => {
+    const seen = new Set();
+    grid.forEach(inning => {
+      GD_FIELD_POS.forEach(pos => { if (inning[pos]) seen.add(inning[pos]); });
+      (inning.BN || []).forEach(id => { if (id) seen.add(id); });
+    });
+    return (roster || []).filter(p => seen.has(p.id));
+  }, [grid, roster]);
+
+  const oppLabel = entry.opponent
+    ? (entry.homeAway === "away" ? `@ ${entry.opponent}` : `vs ${entry.opponent}`)
+    : "Game";
+  const dateStr = entry.date ? (() => {
+    try { return new Date(entry.date + "T12:00:00").toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" }); }
+    catch { return entry.date; }
+  })() : "";
+
+  return (
+    <div style={{
+      position: "fixed", inset: 0, zIndex: 200,
+      background: C.bg, display: "flex", flexDirection: "column",
+      fontFamily: FONT, overflow: "hidden",
+    }}>
+
+      {/* ── Sticky header ── */}
+      <div style={{ background: C.surface, borderBottom: `1px solid ${C.border}`, padding: "10px 12px 10px", flexShrink: 0 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+          <button onClick={onClose} style={{
+            background: "none", border: "none", cursor: "pointer",
+            color: C.textMuted, fontSize: 22, padding: "0 8px 0 0", lineHeight: 1, fontFamily: FONT,
+          }}>←</button>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontFamily: DISPLAY, fontWeight: 700, fontSize: 17, color: C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{oppLabel}</div>
+            {dateStr && <div style={{ fontSize: 11, color: C.textMuted, marginTop: 1 }}>{dateStr}</div>}
+          </div>
+          <button onClick={handleReset} style={{
+            background: "none", border: `1px solid ${C.border}`, cursor: "pointer",
+            color: C.textMuted, fontSize: 11, padding: "5px 12px", borderRadius: 5, fontFamily: FONT,
+          }}>Reset</button>
+        </div>
+
+        {/* Inning pip strip */}
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 0 }}>
+          <button onClick={() => setInn(i => Math.max(0, i - 1))} disabled={inn === 0}
+            style={{ background: "none", border: "none", cursor: inn === 0 ? "default" : "pointer",
+              color: inn === 0 ? C.textLight : C.text, fontSize: 24, padding: "2px 14px",
+              opacity: inn === 0 ? 0.25 : 1, fontFamily: FONT }}>‹</button>
+          <div style={{ display: "flex", gap: 5 }}>
+            {Array.from({ length: totalInnings }, (_, i) => (
+              <button key={i} onClick={() => setInn(i)} style={{
+                width: 34, height: 34, borderRadius: 7,
+                border: `2px solid ${i === inn ? C.accent : C.border}`,
+                background: i === inn ? C.accent : C.surface,
+                color: i === inn ? "#fff" : C.textMuted,
+                fontWeight: i === inn ? 700 : 400, fontSize: 14,
+                cursor: "pointer", fontFamily: FONT,
+              }}>{i + 1}</button>
+            ))}
+          </div>
+          <button onClick={() => setInn(i => Math.min(totalInnings - 1, i + 1))} disabled={inn === totalInnings - 1}
+            style={{ background: "none", border: "none", cursor: inn === totalInnings - 1 ? "default" : "pointer",
+              color: inn === totalInnings - 1 ? C.textLight : C.text, fontSize: 24, padding: "2px 14px",
+              opacity: inn === totalInnings - 1 ? 0.25 : 1, fontFamily: FONT }}>›</button>
+        </div>
+      </div>
+
+      {/* ── Scrollable body ── */}
+      <div style={{ flex: 1, overflowY: "auto", overflowX: "hidden", WebkitOverflowScrolling: "touch" }}
+        onTouchStart={handleTouchStart} onTouchEnd={handleTouchEnd}>
+
+        {/* 4×3 player number grid */}
+        <div style={{ padding: "14px 12px 0" }}>
+          <div style={{ fontSize: 11, color: C.textMuted, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: 8 }}>
+            Roster · tap for inning sequence
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 6 }}>
+            {activePlayers.map(p => {
+              const bc = benchCount[p.id] ?? 0;
+              // Highlight if this player is in the swap selection
+              const inSwap = swapSel && getCellPlayer(swapSel.innIdx, swapSel.slotKey) === p.id;
+              return (
+                <button key={p.id} onClick={() => setPlayerModalId(p.id)} style={{
+                  position: "relative",
+                  background: inSwap ? C.blueLight : C.surface,
+                  border: `1.5px solid ${inSwap ? C.blue : C.border}`,
+                  borderRadius: 10, padding: "10px 4px 8px",
+                  cursor: "pointer", textAlign: "center", fontFamily: FONT,
+                  display: "flex", flexDirection: "column", alignItems: "center", gap: 3,
+                  minHeight: 66,
+                }}>
+                  <div style={{ fontSize: 22, fontWeight: 700, color: inSwap ? C.blue : C.text, lineHeight: 1 }}>{p.number}</div>
+                  <div style={{ fontSize: 10, color: C.textMuted, lineHeight: 1 }}>{p.name}</div>
+                  <div style={{ position: "absolute", top: 5, right: 5 }}>
+                    <BenchScoreBadge count={bc} size="sm" />
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* Current-inning field panel */}
+        <GDInningPanel
+          inn={inn}
+          grid={grid}
+          playerMap={playerMap}
+          swapSel={swapSel}
+          onCellTap={handleCellTap}
+        />
+      </div>
+
+      {/* Player detail bottom-sheet */}
+      {playerModalId && (
+        <GDPlayerModal
+          player={playerMap[playerModalId]}
+          posHistory={posHistory}
+          benchCount={benchCount}
+          totalInnings={totalInnings}
+          onClose={() => setPlayerModalId(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+function GDInningPanel({ inn, grid, playerMap, swapSel, onCellTap }) {
+  const inning = grid[inn] || {};
+
+  const getPlayer = (slotKey) => {
+    if (slotKey.startsWith("BN-")) return (inning.BN || [])[parseInt(slotKey.slice(3), 10)] || null;
+    return inning[slotKey] || null;
+  };
+
+  const tierBg = (playerId, pos) => {
+    if (!playerId || pos === "BN") return C.surfaceAlt;
+    const tier = (playerMap[playerId]?.positionMap?.[pos] || "").split(":")[0];
+    return { preferred: TIER_BG.preferred, secondary: TIER_BG.secondary, emergency: TIER_BG.emergency }[tier] || C.surface;
+  };
+  const tierText = (playerId, pos) => {
+    if (!playerId || pos === "BN") return C.text;
+    const tier = (playerMap[playerId]?.positionMap?.[pos] || "").split(":")[0];
+    if (tier === "preferred") return C.greenText;
+    if (tier === "secondary") return C.tierYellow;
+    if (tier === "emergency") return C.tierOrange;
+    return C.text;
+  };
+
+  return (
+    <div style={{ padding: "14px 12px 32px" }}>
+      <div style={{ fontSize: 11, color: C.textMuted, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: 8, display: "flex", alignItems: "center", gap: 8 }}>
+        <span>Inning {inn + 1}</span>
+        {swapSel && (
+          <span style={{ color: C.blue, fontWeight: 400, textTransform: "none", fontSize: 12 }}>
+            · tap another slot to swap
+          </span>
+        )}
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+        {GD_SLOTS.map((slotKey, idx) => {
+          const isBN       = slotKey.startsWith("BN-");
+          const pos        = isBN ? "BN" : slotKey;
+          const playerId   = getPlayer(slotKey);
+          const player     = playerId ? playerMap[playerId] : null;
+          const isSelected = swapSel && swapSel.innIdx === inn && swapSel.slotKey === slotKey;
+          const showDiv    = slotKey === "BN-0";
+
+          const bg        = isSelected ? C.blueLight
+                           : isBN      ? C.surfaceAlt
+                           : playerId  ? tierBg(playerId, pos)
+                           :             C.surface;
+          const nameColor = isSelected ? C.blue : tierText(playerId, pos);
+
+          return (
+            <React.Fragment key={slotKey}>
+              {showDiv && <div style={{ height: 1, background: C.border, margin: "3px 0" }} />}
+              <button onClick={() => onCellTap(inn, slotKey)} style={{
+                width: "100%", display: "flex", alignItems: "stretch",
+                background: bg,
+                border: isSelected ? `2px solid ${C.blue}` : `1px solid ${C.borderLight}`,
+                borderRadius: 9, padding: 0, cursor: "pointer",
+                fontFamily: FONT, overflow: "hidden", minHeight: 52,
+              }}>
+                {/* Position label column */}
+                <div style={{
+                  width: 48, flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center",
+                  background: C.surfaceAlt, borderRight: `1px solid ${C.borderLight}`,
+                  fontSize: 12, fontWeight: 700, color: C.textMuted,
+                }}>
+                  {isBN ? (slotKey === "BN-0" ? "BN" : "") : slotKey}
+                </div>
+                {/* Player name */}
+                <div style={{ flex: 1, padding: "0 16px", display: "flex", alignItems: "center" }}>
+                  {player ? (
+                    <span>
+                      <span style={{ fontSize: 17, fontWeight: 600, color: nameColor }}>{player.name}</span>
+                      <span style={{ fontSize: 12, color: isSelected ? C.blue : C.textMuted, marginLeft: 7 }}>#{player.number}</span>
+                    </span>
+                  ) : (
+                    <span style={{ fontSize: 15, color: C.textLight, fontStyle: "italic" }}>—</span>
+                  )}
+                </div>
+                {isSelected && (
+                  <div style={{ paddingRight: 14, display: "flex", alignItems: "center", color: C.blue, fontSize: 16, fontWeight: 700 }}>✓</div>
+                )}
+              </button>
+            </React.Fragment>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function GDPlayerModal({ player, posHistory, benchCount, totalInnings, onClose }) {
+  if (!player) return null;
+  const history = posHistory[player.id] || [];
+  const bc      = benchCount[player.id] ?? 0;
+
+  const cellBg   = (pos) => {
+    if (!pos || pos === "BN") return C.surfaceAlt;
+    const tier = (player.positionMap?.[pos] || "").split(":")[0];
+    return { preferred: TIER_BG.preferred, secondary: TIER_BG.secondary, emergency: TIER_BG.emergency }[tier] || C.surface;
+  };
+  const cellText = (pos) => {
+    if (!pos || pos === "BN") return C.textMuted;
+    const tier = (player.positionMap?.[pos] || "").split(":")[0];
+    if (tier === "preferred") return C.greenText;
+    if (tier === "secondary") return C.tierYellow;
+    if (tier === "emergency") return C.tierOrange;
+    return C.text;
+  };
+
+  return (
+    <div style={{
+      position: "fixed", inset: 0, zIndex: 300,
+      background: "rgba(0,0,0,0.5)", display: "flex", alignItems: "flex-end", fontFamily: FONT,
+    }} onClick={onClose}>
+      <div style={{
+        width: "100%", background: C.surface, borderRadius: "18px 18px 0 0",
+        padding: "20px 16px 36px", maxHeight: "72vh", overflowY: "auto",
+      }} onClick={e => e.stopPropagation()}>
+        {/* drag handle */}
+        <div style={{ width: 40, height: 4, borderRadius: 2, background: C.border, margin: "0 auto 18px" }} />
+
+        {/* Player header */}
+        <div style={{ display: "flex", alignItems: "baseline", gap: 10, marginBottom: 20 }}>
+          <div style={{ fontFamily: DISPLAY, fontSize: 28, fontWeight: 700, color: C.text }}>#{player.number}</div>
+          <div style={{ fontSize: 20, fontWeight: 600, color: C.text }}>{player.name}</div>
+          <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 6 }}>
+            <span style={{ fontSize: 12, color: C.textMuted }}>{bc} bench</span>
+            <BenchScoreBadge count={bc} size="md" />
+          </div>
+        </div>
+
+        {/* Inning sequence grid */}
+        <div style={{ display: "grid", gridTemplateColumns: `repeat(${totalInnings}, 1fr)`, gap: 6, marginBottom: 20 }}>
+          {Array.from({ length: totalInnings }, (_, i) => {
+            const pos = history[i] || null;
+            return (
+              <div key={i} style={{ textAlign: "center" }}>
+                <div style={{ fontSize: 10, color: C.textMuted, marginBottom: 4 }}>I{i + 1}</div>
+                <div style={{
+                  background: pos ? cellBg(pos) : C.surfaceAlt,
+                  border: `1px solid ${C.borderLight}`,
+                  borderRadius: 7, padding: "10px 4px",
+                  fontSize: 13, fontWeight: 600,
+                  color: pos ? cellText(pos) : C.textLight,
+                }}>
+                  {pos || "—"}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        <button onClick={onClose} style={{
+          width: "100%", padding: "15px",
+          background: C.surfaceAlt, border: `1px solid ${C.border}`,
+          borderRadius: 10, fontSize: 15, fontWeight: 600,
+          color: C.text, cursor: "pointer", fontFamily: FONT,
+        }}>Done</button>
+      </div>
+    </div>
   );
 }
 
